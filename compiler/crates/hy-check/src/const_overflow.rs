@@ -759,7 +759,17 @@ impl<'a> Checker<'a> {
             match c {
                 ConvConst::Int(v) => {
                     if *v < lo || *v > hi {
-                        if is_64bit_int_target(target) || !is_lit {
+                        // Only reject when the emitter cannot fold this constant
+                        // into a legal literal. 64-bit targets never fold, so they
+                        // reject everything. Sub-64 targets fold bare literals and
+                        // simple unary negations (`uint8(-1)` — upstream
+                        // tests/const_conversion.rs sub64 accept set), so only flag
+                        // constants that are *not* one of these simple foldable
+                        // forms; const identifiers and constant arithmetic (#823)
+                        // are not rewritten by the fold, so they still reject.
+                        if is_64bit_int_target(target)
+                            || !(is_lit || is_simple_unary_negation(arg))
+                        {
                             // 64-bit targets skip the emitter's X4 fold, and
                             // non-literal operands (#823: const identifiers,
                             // constant arithmetic) are not rewritten by it
@@ -1567,6 +1577,29 @@ fn is_64bit_int_target(name: &str) -> bool {
     matches!(
         name,
         "i64" | "int64" | "int" | "isize" | "u64" | "uint64" | "uint" | "usize" | "uintptr"
+    )
+}
+
+/// `uint8(-1)` / `i8(-300)` — a unary minus over an integer literal is
+/// folded exactly like the bare literal (the emitter's SPEC X4 rewrite
+/// truncates both), so it stays accepted (upstream
+/// tests/const_conversion.rs sub64 accept set). Anything else — const
+/// identifiers, constant arithmetic, floats — is NOT rewritten by the
+/// fold and must still reject (#823).
+fn is_simple_unary_negation(arg: &Expr) -> bool {
+    matches!(
+        unwrap_parens(arg),
+        Expr::Unary {
+            op: hy_syntax::UnOp::Neg,
+            operand,
+            ..
+        } if matches!(
+            unwrap_parens(operand),
+            Expr::Lit {
+                kind: hy_syntax::LitKind::Int(_),
+                ..
+            }
+        )
     )
 }
 
