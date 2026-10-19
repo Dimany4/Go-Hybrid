@@ -12,6 +12,15 @@
 //! operands stay out of scope — Go truncates at run time via an explicit
 //! conversion (SPEC-LANGUAGE X4), and the conversion form `int8(x)` is
 //! unaffected.
+//!
+//! Issue #725 extends the pass to TYPED constant ARITHMETIC: a constant
+//! expression with a fixed-width TYPED operand (`const top u8 = 255; top + 1`,
+//! `i64(1) << 63`, `u8(0) - 1`) folds in the OPERAND's type in Go and is
+//! rejected there when the result (or an untyped operand converted to the
+//! typed operand's type) is unrepresentable. The shared fold computed values
+//! in arbitrary precision without the type (and conversions were NotConst),
+//! so these passed with 0 diagnostics and failed `go build`.
+//! `check_typed_const_arith` closes that gap at the init/default-int sites;
 
 use crate::model::{unwrap_parens, Checker, FnState};
 use hy_diag::{Diagnostic, Span};
@@ -29,6 +38,9 @@ impl<'a> Checker<'a> {
         value: &Expr,
         st: Option<&FnState>,
     ) {
+        // Issue #725: typed-constant arithmetic inside the initializer
+        // overflows in the OPERAND's type, independent of the init target.
+        self.check_typed_const_arith(value, st);
         let resolved = self.resolve_type_alias(ty);
         let TypeExpr::Named {
             name: ty_name,
@@ -319,6 +331,9 @@ impl<'a> Checker<'a> {
         value: &Expr,
         st: Option<&FnState>,
     ) {
+        // Issue #725: a typed constant operand must overflow in ITS type
+        // before the untyped default-type check applies.
+        self.check_typed_const_arith(value, st);
         let (lo, hi) = target_int_range();
         match const_int_fold_with(value, &self.const_values, 0, st) {
             ConstFold::NotConst => return,
@@ -615,6 +630,7 @@ impl<'a> Checker<'a> {
             return;
         }
         let arg = unwrap_parens(&args[0].value);
+        let callee = unwrap_parens(callee); // #823: parens are transparent
         // `[]byte("abc")` — a slice type-as-value called with one argument
         // (the standing type-as-value encoding; see hy-emit's conversion
         // branch for the emission half of issue #228).
@@ -629,40 +645,80 @@ impl<'a> Checker<'a> {
                 return;
             }
         }
-        let Expr::Ident { name, .. } = callee else {
+        let Expr::Ident { name, span: id_span, .. } = callee else {
             return;
         };
+        // #823: resolve type aliases — `type my_int = int; my_int("abc")`
+        // and `type my_slice = []int; my_slice("abc")` are conversion calls
+        // of the aliased type, not free function calls. `resolve_type_alias`
+        // handles nesting (`type b = a; type a = int`).
+        let dummy = TypeExpr::Named {
+            name: name.clone(),
+            span: *id_span,
+        };
+        match self.resolve_type_alias(&dummy) {
+            TypeExpr::Named { name: target, .. } => {
+                if is_conversion_target(&target) {
+                    let is_lit = matches!(arg, Expr::Lit { .. });
+                    let Some(c) = self.conv_const(arg, 0) else {
+                        return; // non-constant operand: run-time conversion (SPEC X4)
+                    };
+                    self.check_conv_against_target(&target, &c, arg, span, is_lit);
+                    return;
+                }
+            }
+            TypeExpr::Slice { elem, .. } => {
+                self.check_slice_conversion(&elem, arg, span);
+                return;
+            }
+            _ => {}
+        }
         if !is_conversion_target(name) {
             return;
         }
-        let Some(c) = conv_const(arg) else {
+        let is_lit = matches!(arg, Expr::Lit { .. });
+        let Some(c) = self.conv_const(arg, 0) else {
             return; // non-constant operand: run-time conversion (SPEC X4)
         };
-        self.check_conv_against_target(name, &c, arg, span);
+        self.check_conv_against_target(name, &c, arg, span, is_lit);
     }
 
     fn check_slice_conversion(&mut self, elem: &TypeExpr, arg: &Expr, span: Span) {
         let TypeExpr::Named { name: slice_elem, .. } = elem else {
             return; // []T with a non-named element + a run-time operand
         };
-        match conv_const(arg) {
+        // #823: resolve element type aliases — `type my_elem = u8;
+        // []my_elem("abc")` is a string -> []byte conversion, and
+        // `type my_elem = int; []my_elem("abc")` is an error.
+        let resolved_elem = self
+            .type_aliases
+            .get(slice_elem)
+            .and_then(|ty| {
+                if let TypeExpr::Named { name: target, .. } = ty {
+                    Some(target.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| slice_elem.clone());
+        match self.conv_const(arg, 0) {
             Some(ConvConst::Str) => {
                 // Go allows string -> []byte / []rune (and their aliases)
                 // only; every other element type is a compile error.
                 if !matches!(
-                    slice_elem.as_str(),
+                    resolved_elem.as_str(),
                     "u8" | "byte" | "uint8" | "i32" | "int32" | "rune"
                 ) {
                     self.emit_const_conversion_error(
                         span,
                         format!(
                             "a string constant cannot be converted to a `{}` slice (HYB-E6006)",
-                            slice_elem
+                            resolved_elem
                         ),
                         vec![
                             format!(
                                 "why: Go only allows string -> []byte / []rune conversions; `[]{}(\"…\")` fails to build (`cannot convert ... to type []{}`), so an accepted Hybrid program would emit unbuildable Go (issue #228)",
-                                slice_elem, slice_elem
+                                resolved_elem, resolved_elem
                             ),
                             "fix: convert to `[]byte` (or `[]rune` for text) first, or use a run-time operand whose type matches the target slice".to_string(),
                         ],
@@ -675,12 +731,12 @@ impl<'a> Checker<'a> {
                     format!(
                         "a {} constant cannot be converted to a `{}` slice (HYB-E6006)",
                         c.kind_name(),
-                        slice_elem
+                        resolved_elem
                     ),
                     vec![
                         format!(
                             "why: Go has no constant-to-slice conversion; `[]{}({})` fails to build (`invalid operation: cannot convert ...`), so an accepted Hybrid program would emit unbuildable Go (issue #228)",
-                            slice_elem,
+                            resolved_elem,
                             arg.render()
                         ),
                         "fix: build the slice explicitly (e.g. `[]{}{{{}}}` or `make([]{}, n)` with a variable length)".to_string(),
@@ -691,14 +747,23 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_conv_against_target(&mut self, target: &str, c: &ConvConst, arg: &Expr, span: Span) {
+    fn check_conv_against_target(
+        &mut self,
+        target: &str,
+        c: &ConvConst,
+        arg: &Expr,
+        span: Span,
+        is_lit: bool,
+    ) {
         if let Some((lo, hi)) = fixed_width_int_range(target) {
             match c {
                 ConvConst::Int(v) => {
                     if *v < lo || *v > hi {
-                        if is_64bit_int_target(target) {
-                            // 64-bit targets skip the emitter's X4 fold —
-                            // nothing rewrites this, Go rejects it outright.
+                        if is_64bit_int_target(target) || !is_lit {
+                            // 64-bit targets skip the emitter's X4 fold, and
+                            // non-literal operands (#823: const identifiers,
+                            // constant arithmetic) are not rewritten by it
+                            // either — Go rejects them outright.
                             self.emit_const_conversion_error(
                                 span,
                                 format!(
@@ -720,8 +785,9 @@ impl<'a> Checker<'a> {
                                 ],
                             );
                         }
-                        // sub-64 targets: the emitter's SPEC X4 fold rewrites
-                        // the constant (u8(300) == 44) — accepted on purpose.
+                        // sub-64 LITERAL targets: the emitter's SPEC X4 fold
+                        // rewrites the constant (u8(300) == 44) — accepted
+                        // on purpose.
                     }
                 }
                 ConvConst::Char(v) => {
@@ -874,6 +940,10 @@ impl<'a> Checker<'a> {
                     self.emit_conv_kind_error(target, c, arg, span)
                 }
             },
+            "bool" => match c {
+                ConvConst::Bool => {}
+                _ => self.emit_conv_kind_error(target, c, arg, span),
+            },
             _ => {}
         }
     }
@@ -903,13 +973,517 @@ impl<'a> Checker<'a> {
         self.diags
             .push(Diagnostic::error("HYB-E6006", self.path.clone(), span, msg).with_notes(notes));
     }
+    // ---- Issue #725: typed constant ARITHMETIC overflow (HYB-E6002) ----
+    //
+    // `const top u8 = 255; a := top + 1` and `b := i64(1) << 63` pass
+    // `hyb check` today: the #201-B fold (`const_int_fold_with`) computes
+    // values in arbitrary precision but drops the operands' fixed-width
+    // type, and conversion calls it cannot fold (`i64(1)`) make the whole
+    // expression `NotConst`. Go folds the same expressions in the OPERAND's
+    // type and rejects (`top + 1 (constant 256 of type uint8) overflows
+    // uint8`), so the accepted program emits unbuildable Go (GUARANTEES
+    // Row 13 / BUILDABLE).
+    //
+    // This walker re-checks exactly that shape: a Binary/Unary constant
+    // expression with at least one fixed-width TYPED constant operand (a
+    // file-level `const` with a type ascription, or a spec conversion of a
+    // constant) must fold to a value representable in that type.
+    // Conversions keep the SPEC X4 wrap semantics `hy-emit`'s constconv
+    // fold already applies (`u8(300)` → `uint8(44)`), so checker and
+    // emitter agree; operands are walked first, so a nested overflow is
+    // reported at the inner expression.
+    //
+    // Out of scope, documented: float-typed constants (no integer overflow
+    // domain), local typed `const` (the shared fold treats local `const`
+    // bindings as runtime values), comparison operands (bool result, no
+    // overflow domain), Go-spelled conversion names (`uint8`, `int64`, … —
+    // ordinary identifiers per LX3/#728), closure bodies (closures.rs
+    // scope), and assignment sites (`check_const_overflow_assign` carries
+    // no FnState, so the local-shadowing rule cannot be applied there
+    // safely — the init sites below cover the reported shape).
+    pub(crate) fn check_typed_const_arith(&mut self, e: &Expr, st: Option<&FnState>) {
+        match unwrap_parens(e) {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                self.check_typed_const_arith(lhs, st);
+                self.check_typed_const_arith(rhs, st);
+                use hy_syntax::BinOp::*;
+                let is_shift = matches!(op, Shl | Shr);
+                let arith = matches!(op, Add | Sub | Mul | Div | Mod | Shl | Shr);
+                if !arith {
+                    return;
+                }
+                let lt = self.typed_const_of(lhs, 0, st);
+                let rt = self.typed_const_of(rhs, 0, st);
+                // Shifts take their type from the LEFT operand only (the
+                // count is an arbitrary-width non-negative int in Go).
+                let typed = if is_shift {
+                    lt.clone()
+                } else {
+                    lt.clone().or(rt.clone())
+                };
+                let Some(t) = typed else {
+                    return;
+                };
+                let (lo, hi) = fixed_width_int_range(&t.ty).unwrap_or((i128::MIN, i128::MAX));
+                // A non-shift untyped constant operand must itself be
+                // representable in the typed operand's type (Go converts it
+                // there before the operation).
+                if !is_shift {
+                    if lt.is_none() {
+                        self.check_typed_operand_fits(rhs, st, &t.ty, lo, hi);
+                    }
+                    if rt.is_none() {
+                        self.check_typed_operand_fits(lhs, st, &t.ty, lo, hi);
+                    }
+                }
+                let l = self.typed_const_value_of(lhs, st);
+                let r = self.typed_const_value_of(rhs, st);
+                match fold_bin(*op, l, r) {                    ConstFold::Val(v) => {
+                        if v < lo || v > hi {
+                            let span = e.span();
+                            let msg = format!(
+                                "typed constant expression `{}` = {} overflows `{}` (range [{}, {}]) (HYB-E6002)",
+                                e.render(),
+                                v,
+                                t.ty,
+                                lo,
+                                hi
+                            );
+                            let notes = vec![
+                                format!(
+                                    "why: Go folds the constant expression in the operand's type and rejects it (`constant {} of type {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
+                                    v, t.ty, t.ty
+                                ),
+                                format!(
+                                    "fix: keep the constant in [{}, {}], widen the operand type, or convert from a runtime variable if wrapping is intentional",
+                                    lo, hi
+                                ),
+                            ];
+                            self.diags.push(
+                                Diagnostic::error("HYB-E6002", self.path.clone(), span, msg)
+                                    .with_notes(notes),
+                            );
+                        }
+                    }
+                    ConstFold::TooBig => {
+                        let span = e.span();
+                        let msg = format!(
+                            "typed constant expression `{}` overflows `{}` (HYB-E6002)",
+                            e.render(),
+                            t.ty
+                        );
+                        let notes = vec![
+                            format!(
+                                "why: Go folds the constant expression in the operand's type and rejects a value outside `{}` (`constant … of type {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
+                                t.ty, t.ty, t.ty
+                            ),
+                            format!(
+                                "fix: keep the constant in [{}, {}], widen the operand type, or convert from a runtime variable if wrapping is intentional",
+                                lo, hi
+                            ),
+                        ];
+                        self.diags.push(
+                            Diagnostic::error("HYB-E6002", self.path.clone(), span, msg)
+                                .with_notes(notes),
+                        );
+                    }
+                    ConstFold::NotConst => {}
+                }
+            }            Expr::Unary { op: UnOp::Neg, operand, .. } => {
+                self.check_typed_const_arith(operand, st);
+                if let Some(t) = self.typed_const_of(operand, 0, st) {
+                    let (lo, hi) = fixed_width_int_range(&t.ty).unwrap_or((i128::MIN, i128::MAX));
+                    let overflow = match t.val.checked_neg() {
+                        Some(v) => v < lo || v > hi,
+                        None => true,
+                    };
+                    if overflow {
+                        let span = e.span();
+                        let msg = format!(
+                            "typed constant expression `{}` overflows `{}` (range [{}, {}]) (HYB-E6002)",
+                            e.render(),
+                            t.ty,
+                            lo,
+                            hi
+                        );
+                        let notes = vec![
+                            format!(
+                                "why: Go folds `-({})` in the operand's type `{}` and rejects the result (`constant … of type {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
+                                operand.render(),
+                                t.ty,
+                                t.ty,
+                                t.ty
+                            ),
+                            format!(
+                                "fix: use a value whose negation fits in [{}, {}], or widen the operand type",
+                                lo, hi
+                            ),
+                        ];
+                        self.diags.push(
+                            Diagnostic::error("HYB-E6002", self.path.clone(), span, msg)
+                                .with_notes(notes),
+                        );
+                    }
+                }
+            }
+            Expr::Unary { operand, .. } => self.check_typed_const_arith(operand, st),
+            Expr::Call { args, .. } => {
+                for a in args {
+                    self.check_typed_const_arith(&a.value, st);
+                }
+            }
+            Expr::Index { base, index, .. } => {
+                self.check_typed_const_arith(base, st);
+                self.check_typed_const_arith(index, st);
+            }
+            Expr::Field { base, .. } => self.check_typed_const_arith(base, st),
+            Expr::Slice { base, lo, hi, .. } => {
+                self.check_typed_const_arith(base, st);
+                if let Some(x) = lo {
+                    self.check_typed_const_arith(x, st);
+                }
+                if let Some(x) = hi {
+                    self.check_typed_const_arith(x, st);
+                }
+            }
+            Expr::SliceLit { items, .. } => {
+                for i in items {
+                    self.check_typed_const_arith(i, st);
+                }
+            }
+            Expr::MapLit { entries, .. } => {
+                for (k, v) in entries {
+                    self.check_typed_const_arith(k, st);
+                    self.check_typed_const_arith(v, st);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for f in fields {
+                    self.check_typed_const_arith(&f.value, st);
+                }
+            }
+            Expr::Interp { parts, .. } => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        self.check_typed_const_arith(x, st);
+                    }
+                }
+            }
+            // FnLit bodies are the closures.rs pass's scope; literals are done.
+            _ => {}
+        }
+    }    /// A non-typed constant operand of a typed constant expression must be
+    /// representable in the typed operand's type (Go converts it there
+    /// before the operation: `top - 300` fails even though only `300` is
+    /// out of `u8` range). Runtime operands fold to NotConst and skip.
+    fn check_typed_operand_fits(&mut self, e: &Expr, st: Option<&FnState>, ty: &str, lo: i128, hi: i128) {
+        if self.typed_const_of(e, 0, st).is_some() {
+            return;
+        }
+        match const_int_fold_with(e, &self.const_values, 0, st) {
+            ConstFold::Val(v) if v < lo || v > hi => {
+                let span = e.span();
+                let msg = format!(
+                    "constant `{}` overflows `{}` in a typed constant expression (HYB-E6002)",
+                    e.render(),
+                    ty
+                );
+                let notes = vec![
+                    format!(
+                        "why: Go converts the untyped constant operand to the typed operand's type `{}` before the operation (`constant {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
+                        ty, v, ty
+                    ),
+                    format!(
+                        "fix: use an operand in [{}, {}], or convert from a runtime variable",
+                        lo, hi
+                    ),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// The constant integer value of `e`, preferring the typed reading (a
+    /// spec conversion of a constant is `NotConst` for the shared fold).
+    fn typed_const_value_of(&self, e: &Expr, st: Option<&FnState>) -> ConstFold {
+        match self.typed_const_of(e, 0, st) {
+            Some(t) => ConstFold::Val(t.val),
+            None => const_int_fold_with(e, &self.const_values, 0, st),
+        }
+    }    /// The constant value of `e` WITH its fixed-width integer type, when it
+    /// is a typed constant: a file-level `const` with a fixed-width type
+    /// ascription, a Hybrid-spec conversion of a constant (X4 wrap — the
+    /// same two's-complement truncation `hy-emit`'s constconv fold applies),
+    /// a negation of one, or an arithmetic combination whose result fits
+    /// (an overflowing sub-expression is rejected at its own node first, so
+    /// `None` here means the walker already diagnosed it, the operand is
+    /// runtime, or the type is not fixed-width).
+    fn typed_const_of(&self, e: &Expr, depth: u32, st: Option<&FnState>) -> Option<TypedConst> {
+        if depth > 32 {
+            return None;
+        }
+        match unwrap_parens(e) {
+            Expr::Ident { name, .. } => {
+                if let Some(st) = st {
+                    if st.env_lookup(name).is_some() {
+                        // A local binding shadows the file-level const (same
+                        // rule as `const_int_fold_with`); local typed consts
+                        // are outside this pass's scope.
+                        return None;
+                    }
+                }
+                let cdecl = self.file_const_decl(name)?;
+                let ty = cdecl.ty.as_ref()?;
+                let resolved = self.resolve_type_alias(ty);
+                let TypeExpr::Named { name: ty_name, .. } = &resolved else {
+                    return None;
+                };
+                if fixed_width_int_range(ty_name).is_none() {
+                    return None;
+                }
+                match const_int_fold_with(&cdecl.value, &self.const_values, depth + 1, None) {
+                    ConstFold::Val(v) => Some(TypedConst {
+                        val: v,
+                        ty: ty_name.clone(),
+                    }),
+                    _ => None,
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                if args.len() != 1 || args[0].spread {
+                    return None;
+                }
+                let Expr::Ident { name, .. } = unwrap_parens(callee) else {
+                    return None;
+                };
+                // Hybrid-spec conversion spellings only (LX3): Go's spelled
+                // variants (`uint8`, `int64`, …) are ordinary identifiers
+                // (#728) and stay out of this pass.
+                if !is_spec_int_conv(name) {
+                    return None;
+                }
+                if let Some(st) = st {
+                    if st.env_lookup(name).is_some() {
+                        return None;
+                    }
+                }
+                if self.const_values.contains_key(name.as_str()) {
+                    return None;
+                }
+                match const_int_fold_with(&args[0].value, &self.const_values, depth + 1, st) {
+                    ConstFold::Val(v) => {
+                        let (lo, hi) = fixed_width_int_range(name)?;
+                        // SPEC X4 wrap, verbatim from hy-emit/constconv.rs:
+                        // two's-complement truncation into the target width.
+                        let len = hi - lo + 1;
+                        let masked = v & (len - 1);
+                        let folded = if lo < 0 && masked > hi {
+                            masked - len
+                        } else {
+                            masked
+                        };
+                        Some(TypedConst {
+                            val: folded,
+                            ty: name.clone(),
+                        })
+                    }
+                    _ => None,
+                }
+            }            Expr::Unary { op: UnOp::Neg, operand, .. } => {
+                let t = self.typed_const_of(operand, depth + 1, st)?;
+                let (lo, hi) = fixed_width_int_range(&t.ty)?;
+                match t.val.checked_neg() {
+                    Some(v) if v >= lo && v <= hi => Some(TypedConst {
+                        val: v,
+                        ty: t.ty,
+                    }),
+                    _ => None,
+                }
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let lt = self.typed_const_of(lhs, depth + 1, st);
+                let rt = self.typed_const_of(rhs, depth + 1, st);
+                let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                let t = if is_shift { lt? } else { lt.or(rt)? };
+                let (lo, hi) = fixed_width_int_range(&t.ty)?;
+                let l = self.typed_const_value_of(lhs, st);
+                let r = self.typed_const_value_of(rhs, st);
+                match fold_bin(*op, l, r) {
+                    ConstFold::Val(v) if v >= lo && v <= hi => Some(TypedConst {
+                        val: v,
+                        ty: t.ty,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 
 
+    /// #823: fold a constant conversion operand. Resolves file-level `const`
+    /// identifiers recursively and folds constant arithmetic (`1.5 + 1.0`,
+    /// `1 << 63`) and comparisons (`1 < 2`) so `u8(N)`, `int(f)`, `[]int(s)`,
+    /// and `int(1 < 2)` are checked exactly as Go folds them. Local shadowing
+    /// is not visible here (Pass B), so an ident resolves through the
+    /// file-level `const` table — the fail-open rule `typed_const_of`
+    /// applies when the scope is unknown.
+    fn conv_const(&self, e: &Expr, depth: usize) -> Option<ConvConst> {
+        if depth > 32 {
+            return None;
+        }
+        match unwrap_parens(e) {
+            Expr::Lit { kind, .. } => Some(match kind {
+                LitKind::Int(s) => match parse_int_lit(s) {
+                    Some(ConstInt::Value(v)) => ConvConst::Int(v),
+                    Some(ConstInt::PosOverflow) | Some(ConstInt::NegOverflow) | None => {
+                        ConvConst::Huge {
+                            f: huge_int_as_f64(s),
+                            lt_512: lit_below_2_512(s),
+                        }
+                    }
+                },
+                LitKind::Float(s) => ConvConst::Float(s.parse::<f64>().unwrap_or(f64::INFINITY)),
+                LitKind::Char(c) => ConvConst::Char(*c as i32),
+                LitKind::Str(_) | LitKind::RawStr(_) => ConvConst::Str,
+                LitKind::Bool(_) => ConvConst::Bool,
+                LitKind::Nil => ConvConst::Nil,
+            }),
+            Expr::Ident { name, .. } => {
+                let cdecl = self.file_const_decl(name)?;
+                self.conv_const(&cdecl.value, depth + 1)
+            }
+            Expr::Unary { op, operand, .. } => {
+                let c = self.conv_const(operand, depth + 1)?;
+                match op {
+                    UnOp::Neg => match c {
+                        ConvConst::Int(v) => Some(match v.checked_neg() {
+                            Some(n) => ConvConst::Int(n),
+                            None => ConvConst::Huge {
+                                f: -(v as f64),
+                                lt_512: true,
+                            },
+                        }),
+                        ConvConst::Float(f) => Some(ConvConst::Float(-f)),
+                        ConvConst::Huge { f, lt_512 } => Some(ConvConst::Huge { f: -f, lt_512 }),
+                        other => Some(other),
+                    },
+                    _ => None,
+                }
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let l = self.conv_const(lhs, depth + 1)?;
+                let r = self.conv_const(rhs, depth + 1)?;
+                self.fold_conv_bin(op, l, r)
+            }
+            _ => None,
+        }
+    }
+
+    /// Constant folding of one binary operator on two already-folded
+    /// operands. Kinds stay honest: string addition is `Str`, comparisons
+    /// and logic are `Bool`, and numeric arithmetic folds Int/Float/Huge
+    /// exactly (arbitrary-precision ints, Go-style untyped promotion).
+    fn fold_conv_bin(&self, op: &BinOp, l: ConvConst, r: ConvConst) -> Option<ConvConst> {
+        match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                return Some(ConvConst::Bool);
+            }
+            BinOp::And | BinOp::Or => {
+                return match (l, r) {
+                    (ConvConst::Bool, ConvConst::Bool) => Some(ConvConst::Bool),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        let (li, ri) = match (&l, &r) {
+            (ConvConst::Int(a), ConvConst::Int(b)) => (*a, *b),
+            (ConvConst::Char(a), ConvConst::Int(b)) => (*a as i128, *b),
+            (ConvConst::Int(a), ConvConst::Char(b)) => (*a, *b as i128),
+            (ConvConst::Char(a), ConvConst::Char(b)) => (*a as i128, *b as i128),
+            _ => {
+                return match (op, l, r) {
+                    (BinOp::Add, ConvConst::Str, ConvConst::Str) => Some(ConvConst::Str),
+                    (BinOp::Add, ConvConst::Float(a), ConvConst::Float(b)) => {
+                        Some(ConvConst::Float(a + b))
+                    }
+                    (BinOp::Sub, ConvConst::Float(a), ConvConst::Float(b)) => {
+                        Some(ConvConst::Float(a - b))
+                    }
+                    (BinOp::Mul, ConvConst::Float(a), ConvConst::Float(b)) => {
+                        Some(ConvConst::Float(a * b))
+                    }
+                    _ => None,
+                };
+            }
+        };
+        Some(match op {
+            BinOp::Add => ConvConst::Int(li.checked_add(ri)?),
+            BinOp::Sub => ConvConst::Int(li.checked_sub(ri)?),
+            BinOp::Mul => ConvConst::Int(li.checked_mul(ri)?),
+            BinOp::Div => {
+                if ri == 0 {
+                    return None;
+                }
+                ConvConst::Int(li.checked_div(ri)?)
+            }
+            BinOp::Mod => {
+                if ri == 0 {
+                    return None;
+                }
+                ConvConst::Int(li.checked_rem(ri)?)
+            }
+            BinOp::BitAnd => ConvConst::Int(li & ri),
+            BinOp::BitOr => ConvConst::Int(li | ri),
+            BinOp::BitXor => ConvConst::Int(li ^ ri),
+            BinOp::Shl => {
+                let r = u32::try_from(ri).ok()?;
+                if r >= 128 {
+                    return None;
+                }
+                ConvConst::Int(li.checked_shl(r)?)
+            }
+            BinOp::Shr => {
+                let r = u32::try_from(ri).ok()?;
+                if r >= 128 {
+                    return None;
+                }
+                ConvConst::Int(li.checked_shr(r)?)
+            }
+            _ => return None, // unknown operator: not a constant fold here
+        })
+    }
 }
 
 
+/// A constant integer expression with a KNOWN fixed-width integer type
+/// (issue #725): the folded value plus the type name that must represent
+/// it. Produced for typed `const` idents, spec conversions of constants,
+/// negations, and fitting arithmetic combinations of those.
+#[derive(Debug, Clone)]
+struct TypedConst {
+    val: i128,
+    ty: String,
+}
+
+/// The Hybrid-spec conversion spellings (LX3 predeclared) whose constant
+/// arithmetic this pass models: fixed-width integer types only. Go's
+/// spelled variants (`uint8`, `int64`, `float32`, …) are ordinary Hybrid
+/// identifiers (LX3 / issue #728) and stay out of scope.
+fn is_spec_int_conv(name: &str) -> bool {
+    matches!(
+        name,
+        "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "int" | "uint" | "byte" | "rune"
+    )
+}
+
 /// A literal-constant conversion operand (the literal-only scope shared with
 /// E6001/E6002). Anything else — idents, binary ops, calls — is out of
+/// scope: it is either run-time (SPEC X4) or another pass's business. Anything else — idents, binary ops, calls — is out of
 /// scope: it is either run-time (SPEC X4) or another pass's business.
 enum ConvConst {
     Int(i128),
@@ -936,49 +1510,6 @@ impl ConvConst {
             ConvConst::Bool => "boolean",
             ConvConst::Nil => "nil",
         }
-    }
-}
-
-fn conv_const(e: &Expr) -> Option<ConvConst> {
-    match unwrap_parens(e) {
-        Expr::Lit { kind, .. } => Some(match kind {
-            LitKind::Int(s) => match parse_int_lit(s) {
-                // ConstInt (issue #297): PosOverflow/NegOverflow literals are
-                // past i128 — the Huge f64 reading still decides float and
-                // 2^512-boundary string targets exactly as the None case did.
-                Some(ConstInt::Value(v)) => ConvConst::Int(v),
-                Some(ConstInt::PosOverflow) | Some(ConstInt::NegOverflow) | None => {
-                    ConvConst::Huge {
-                        f: huge_int_as_f64(s),
-                        lt_512: lit_below_2_512(s),
-                    }
-                }
-            },
-            LitKind::Float(s) => ConvConst::Float(s.parse::<f64>().unwrap_or(f64::INFINITY)),
-            LitKind::Char(c) => ConvConst::Char(*c as i32),
-            LitKind::Str(_) | LitKind::RawStr(_) => ConvConst::Str,
-            LitKind::Bool(_) => ConvConst::Bool,
-            LitKind::Nil => ConvConst::Nil,
-        }),
-        Expr::Unary {
-            op: UnOp::Neg,
-            operand,
-            ..
-        } => match conv_const(unwrap_parens(operand))? {
-            ConvConst::Int(v) => Some(match v.checked_neg() {
-                Some(n) => ConvConst::Int(n),
-                None => ConvConst::Huge {
-                    // only reachable for `-i128::MIN` — |2^127| well under
-                    // 2^512 and inside f64/f32 range both.
-                    f: -(v as f64),
-                    lt_512: true,
-                },
-            }),
-            ConvConst::Float(f) => Some(ConvConst::Float(-f)),
-            ConvConst::Huge { f, lt_512 } => Some(ConvConst::Huge { f: -f, lt_512 }),
-            other => Some(other),
-        },
-        _ => None,
     }
 }
 
@@ -1024,7 +1555,10 @@ fn huge_int_as_f64(s: &str) -> f64 {
 /// True when `name` is a built-in conversion target of `Type(const)` calls.
 fn is_conversion_target(name: &str) -> bool {
     fixed_width_int_range(name).is_some()
-        || matches!(name, "f32" | "f64" | "float32" | "float64" | "string")
+        || matches!(
+            name,
+            "f32" | "f64" | "float32" | "float64" | "string" | "bool"
+        )
 }
 
 /// Targets the emitter's SPEC X4 fold skips (`bits >= 64`) — constants here
@@ -1491,5 +2025,255 @@ mod unit {
         );
         assert_eq!(target_int_range(), (i64::MIN as i128, i64::MAX as i128));
         assert_eq!(target_uint_range(), (0, u64::MAX as i128));
+    }
+}
+
+#[cfg(test)]
+mod typed_arith_tests {
+    use crate::{check_file, Verdict};
+
+    fn check(src: &str) -> crate::CheckResult {
+        let ast = hy_syntax::parse_file("test.hy", src).expect("test source must parse");
+        check_file(&ast)
+    }
+
+    /// Issue #725 lead: `top + 1` folds to 256 in the OPERAND's type `u8` —
+    /// Go rejects `constant 256 of type uint8 overflows uint8`.
+    #[test]
+    fn typed_const_ident_arith_overflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             const top u8 = 255\n\
+             fn main() {\n\
+               a := top + 1\n\
+               fmt.println(\"{a}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// `i64(1) << 63` — the conversion operand was invisible to the shared
+    /// fold (NotConst); the typed reading folds 1<<63 and rejects in i64.
+    #[test]
+    fn typed_conv_shift_overflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               b := i64(1) << 63\n\
+               fmt.println(\"{b}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Both operands typed (`u8(250) + u8(10)`): the folded result 260
+    /// overflows u8 in Go.
+    #[test]
+    fn typed_conv_arith_overflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               c := u8(250) + u8(10)\n\
+               fmt.println(\"{c}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// `u8(0) - 1` → -1 is unrepresentable in u8.
+    #[test]
+    fn typed_conv_sub_underflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               d := u8(0) - 1\n\
+               fmt.println(\"{d}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// `-u8(1)` — unary negation of a typed constant overflows u8.
+    #[test]
+    fn unary_neg_typed_const_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               e := -u8(1)\n\
+               fmt.println(\"{e}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+    /// `i8(-128) / -1` → 128 overflows i8 (Go: `constant 128 of type int8 overflows int8`).
+    #[test]
+    fn typed_conv_div_overflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               f := i8(-128) / -1\n\
+               fmt.println(\"{f}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// `int(u8(255) + 1)` — the nested inner expression overflows first and
+    /// is reported at its own span.
+    #[test]
+    fn nested_conversion_arg_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               g := int(u8(255) + 1)\n\
+               fmt.println(\"{g}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// File-level `const` with a typed constant initializer that overflows
+    /// (the file-level init site carries no FnState — must still reject).
+    #[test]
+    fn file_const_typed_init_overflow_rejected() {
+        let r = check("const bad i8 = i8(127) + 1\n");
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Typed `var` initializer: `var b u8 = u8(255) + 1` (the init site
+    /// with an explicit type).
+    #[test]
+    fn typed_var_init_overflow_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               var b u8 = u8(255) + 1\n\
+               fmt.println(\"{b}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Control: in-range typed arithmetic stays accepted.
+    #[test]
+    fn in_range_typed_arith_accepted() {
+        let r = check(
+            "import \"fmt\"\n\
+             const top u8 = 255\n\
+             fn main() {\n\
+               ok := u8(250) + u8(5)\n\
+               fine := top - 255\n\
+               fmt.println(\"{ok} {fine}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Control: the SPEC X4 conversion wrap (`u8(300)` → 44) is the
+    /// emitter's defined behavior and must stay accepted.
+    #[test]
+    fn conversion_wrap_still_accepted() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               w := u8(300)\n\
+               fmt.println(\"{w}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Control: runtime operands are out of scope (X4 run-time conversion).
+    #[test]
+    fn runtime_operand_still_accepted() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               w := 300\n\
+               v := u8(w)\n\
+               fmt.println(\"{v}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Control: a local binding shadowing a typed const disables the typed
+    /// reading (same rule as the shared fold) — no false reject.
+    #[test]
+    fn local_shadow_not_misread_as_typed_const() {
+        let r = check(
+            "import \"fmt\"\n\
+             const top u8 = 255\n\
+             fn main() {\n\
+               top := 5\n\
+               x := top + 1\n\
+               fmt.println(\"{x}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Regression guard: the untyped-constant overflow path (issue #228)
+    /// must keep rejecting — `x := 1 << 63` overflows the default `int`.
+    #[test]
+    fn untyped_default_int_overflow_still_rejected() {
+        let r = check(
+            "import \"fmt\"\n\
+             fn main() {\n\
+               x := 1 << 63\n\
+               fmt.println(\"{x}\")\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E6002"),
+            "expected HYB-E6002, got {:?}",
+            r.diagnostics
+        );
     }
 }

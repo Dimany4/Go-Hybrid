@@ -294,6 +294,9 @@ fn build_tables(ck: &mut Checker<'_>) {
                 ck.check_expr_emit_guard(&FnState::default(), &c.value);
                 ck.check_composite_nils(&FnState::default(), &c.value);
                 ck.check_expr_builtin_args(&c.value);
+                // Issue #823: file-level const initializers run the same
+                // HYB-E6006 conversion-target validation as locals.
+                ck.check_expr_type_conversions(&c.value);
                 let b = ck.const_binding(c);
                 ck.consts.insert(c.name.clone(), b);
                 ck.check_const_init_is_constant(&c.name, &c.value, None);
@@ -523,7 +526,9 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         ck.check_addr_of_loan(&st, &uses);
         // T24 + O8: a live slot loan cannot be re-bound to a general
         // pointer — the loan lowers to a copy + store-back (HYB-E3104).
-        ck.check_slot_loan_rebind(&st, stmt);
+        // Issue #831: also rejects rebinding the loan's *base* binding
+        // (HYB-E3102) while the loan is live.
+        ck.check_slot_loan_rebind(&st, stmt, idx);
 
         let mut fnlits = Vec::new();
         walk::own_fnlits(stmt, &mut fnlits);
