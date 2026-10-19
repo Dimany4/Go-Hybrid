@@ -2052,6 +2052,18 @@ impl<'a> Collector<'a> {
                     }
                 }
             }
+            // Pointer parameters take the address of a value argument at
+            // the emission boundary (issue #694 auto-addressing): `f(s)`
+            // with `fn f(p *stats)` emits `f(&s)` — structs, slices (the
+            // pop prelude takes `*[]t`), atomic handles, and field
+            // projections are all addressed at the call site. A value
+            // argument whose kind matches the pointee kind is therefore
+            // assignable; const/loan passes still own mutability (E3006).
+            if let OpKind::Pointer(pointee) = &want {
+                if **pointee == got {
+                    continue;
+                }
+            }
             self.emit_e1002(
                 span,
                 format!(
