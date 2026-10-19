@@ -382,17 +382,23 @@ impl<'a> Checker<'a> {
             } if items.is_empty() => MakeTargetKind::Slice,
             Expr::MapLit { entries, .. } if entries.is_empty() => MakeTargetKind::Map,
             Expr::StructLit {
-                ty: Some(hy_syntax::TypeExpr::Chan { .. }),
+                ty: Some(hy_syntax::TypeExpr::Chan { dir, .. }),
                 fields,
                 ..
-            } if fields.is_empty() => MakeTargetKind::Chan,
+            } if fields.is_empty() => match dir {
+                hy_syntax::ChanDir::Both => MakeTargetKind::Chan,
+                _ => MakeTargetKind::DirectionalChan,
+            },
             Expr::Ident { name, .. } => {
                 let base = Self::base_named_type_str(name);
                 if let Some(ty) = self.type_aliases.get(base) {
                     match self.resolve_type_alias(ty) {
                         hy_syntax::TypeExpr::Slice { .. } => MakeTargetKind::Slice,
                         hy_syntax::TypeExpr::Map { .. } => MakeTargetKind::Map,
-                        hy_syntax::TypeExpr::Chan { .. } => MakeTargetKind::Chan,
+                        hy_syntax::TypeExpr::Chan { dir, .. } => match dir {
+                            hy_syntax::ChanDir::Both => MakeTargetKind::Chan,
+                            _ => MakeTargetKind::DirectionalChan,
+                        },
                         _ => MakeTargetKind::Invalid,
                     }
                 } else {
@@ -435,6 +441,14 @@ impl<'a> Checker<'a> {
                     );
                     return;
                 }
+            }
+            MakeTargetKind::DirectionalChan => {
+                self.emit_builtin(
+                    span,
+                    "`make` does not accept a directional channel type (`<-chan T` / `chan<- T`) — Go requires a bidirectional `chan T` for allocation (HYB-E2005)"
+                        .to_string(),
+                );
+                return;
             }
             MakeTargetKind::Map | MakeTargetKind::Chan => {
                 if args.len() > 2 {
@@ -533,6 +547,7 @@ enum MakeTargetKind {
     Slice,
     Map,
     Chan,
+    DirectionalChan,
     Invalid,
 }
 
@@ -626,4 +641,53 @@ fn is_string_literal(e: &Expr) -> bool {
             ..
         }
     )
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::{check_file, Verdict};
+    use hy_syntax::parse_file;
+
+    fn check(src: &str) -> crate::CheckResult {
+        let ast = parse_file("t.hy", src).expect("snippet parses");
+        check_file(&ast)
+    }
+
+    fn first_error_code(r: &crate::CheckResult) -> Option<&str> {
+        r.diagnostics
+            .iter()
+            .find(|d| d.severity == hy_diag::Severity::Error)
+            .map(|d| d.code.as_str())
+    }
+
+    // --- Issue #793: make() must reject directional channel types ---
+
+    #[test]
+    fn make_directional_recv_chan_rejected() {
+        let r = check("fn main() {\n ch := make(<-chan int)\n _ = ch\n}");
+        assert_eq!(r.verdict, Verdict::Reject);
+        assert_eq!(first_error_code(&r), Some("HYB-E2005"));
+    }
+
+    #[test]
+    fn make_directional_send_chan_rejected() {
+        let r = check("fn main() {\n ch := make(chan<- int)\n _ = ch\n}");
+        assert_eq!(r.verdict, Verdict::Reject);
+        assert_eq!(first_error_code(&r), Some("HYB-E2005"));
+    }
+
+    #[test]
+    fn make_bidirectional_chan_accepted() {
+        let r = check("fn main() {\n ch := make(chan int)\n _ = ch\n}");
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn make_directional_chan_alias_rejected() {
+        let src = "type recv_ints = <-chan int\nfn main() {\n ch := make(recv_ints)\n _ = ch\n}";
+        let r = check(src);
+        assert_eq!(r.verdict, Verdict::Reject);
+        assert_eq!(first_error_code(&r), Some("HYB-E2005"));
+    }
 }
