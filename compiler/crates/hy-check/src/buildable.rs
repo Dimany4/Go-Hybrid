@@ -46,8 +46,8 @@
 use hy_diag::{Diagnostic, Span};
 use hy_syntax::{
     AssignOp, BinOp, Block, CallArg, Decl, Expr, FieldInit, File, FnDecl, ForKind, InterpPart,
-    LitKind, LocalDecl, LocalKind, MatchPattern, Place, PlaceKind, SelectArmKind, Stmt, TypeExpr,
-    UnOp,
+    LitKind, LocalDecl, LocalKind, MatchPattern, Param, Place, PlaceKind, SelectArmKind, Stmt,
+    TypeExpr, UnOp,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -752,10 +752,31 @@ impl<'a> Collector<'a> {
                 }
                 self.check_return(values, *span);
             }
-            Stmt::Task { callee, args, .. } => {
+            Stmt::Task { callee, args, span } => {
                 self.expr(callee);
                 for a in args {
                     self.expr(&a.value);
+                }
+                // #898: a spawn's arguments must satisfy the callee's declared
+                // parameter types exactly like a plain call. Sendability's
+                // nil-shape scan is the only task-arg check today, so
+                // `task worker("wrong_type")` passed with 0 diagnostics and
+                // failed `go build`. Same guard shape as check_call_operands:
+                // a declared `fn` (Ident callee that is not a local binding)
+                // gets the fn check, a Field callee gets the method check,
+                // and anything else stays fail-open.
+                let bare = unwrap_parens(callee);
+                match bare {
+                    Expr::Ident { name, .. } => {
+                        if self.lookup_kind(name).is_none() {
+                            self.check_user_fn_arity(name, args, *span);
+                        }
+                    }
+                    Expr::Field { base, name, .. } => {
+                        let bk = self.kind_of_expr(base);
+                        self.check_method_arity(&bk, name, args, *span);
+                    }
+                    _ => {}
                 }
             }
             Stmt::Managed { body, .. } => self.block_scoped(body),
@@ -1901,6 +1922,11 @@ impl<'a> Collector<'a> {
         }
         let (want, got) = (f.params.len(), args.len());
         if want == got {
+            // #898: the counts line up, so the remaining build-failure class
+            // here is an argument type the parameter does not accept — Go
+            // refuses `cannot use ... as ... value in argument to ...`.
+            let params = f.params.clone();
+            self.check_fn_arg_types(name, &params, args, span);
             return;
         }
         let msg = if got < want {
@@ -1943,6 +1969,11 @@ impl<'a> Collector<'a> {
         }
         let (want, got) = (m.params.len(), args.len());
         if want == got {
+            // #898: same type-argument check as the fn path (see
+            // check_user_fn_arity); the callee label carries the receiver
+            // type so the diagnostic reads like Go's method-call refusal.
+            let params = m.params.clone();
+            self.check_fn_arg_types(&format!("{}.{}", sn, name), &params, args, span);
             return;
         }
         let msg = if got < want {
@@ -1973,6 +2004,68 @@ impl<'a> Collector<'a> {
             msg,
             "the receiver is not an argument: pass one argument per declared parameter",
         );
+    }
+
+    /// #898 — each argument must be assignable to the declared parameter
+    /// type. Arity (#577 C8/C9) already guarantees the counts line up; this
+    /// closes the type half: `worker("x")` for `fn worker(id int)` passed
+    /// `hyb check` with 0 diagnostics and then failed `go build` with
+    /// `cannot use "x" as int value in argument to worker`.
+    ///
+    /// Reuses the return check's conservative `kinds_conflict` model: an
+    /// unresolved side stays permissive, an `any` target accepts anything,
+    /// and an untyped int constant still converts to a float parameter. One
+    /// extra Go-faithful case the kind model cannot see: an untyped FLOAT
+    /// constant with no fractional part is assignable to an integer
+    /// parameter (`f(1.0)` builds in Go; `f(1.5)` does not), decided from
+    /// the literal's value. Range representability (`300.0` into an `int8`)
+    /// stays out of scope, like every integer range in this model. One
+    /// diagnostic per call site is enough.
+    fn check_fn_arg_types(
+        &mut self,
+        callee: &str,
+        params: &[Param],
+        args: &[CallArg],
+        span: Span,
+    ) {
+        for (idx, (p, a)) in params.iter().zip(args.iter()).enumerate() {
+            let want = self.kind_of_ty(&p.ty, 0);
+            let got = self.kind_of_expr(&a.value);
+            if !kinds_conflict(&want, &got) {
+                continue;
+            }
+            // Untyped float constant -> integer parameter: legal when the
+            // constant is integer-valued (`f(1.0)` builds in Go), illegal
+            // otherwise (`f(1.5)` refuses). The kind model classifies both
+            // as Float, so decide from the literal itself.
+            if matches!(want, OpKind::Int) && matches!(got, OpKind::Float) {
+                if let Expr::Lit {
+                    kind: LitKind::Float(s),
+                    ..
+                } = unwrap_parens(&a.value)
+                {
+                    if s.parse::<f64>()
+                        .map(|f| f.fract() == 0.0)
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
+            }
+            self.emit_e1002(
+                span,
+                format!(
+                    "cannot use `{}` (type {}) as argument {} in call to `{}` (parameter type {}) — Go refuses `cannot use ... as ... value in argument to ...` (HYB-E1002)",
+                    a.value.render(),
+                    got.label(),
+                    idx + 1,
+                    callee,
+                    p.ty.render()
+                ),
+                "pass an argument assignable to the declared parameter type",
+            );
+            return;
+        }
     }
 
     /// #577 C10 — a `return` must supply the enclosing function's result
