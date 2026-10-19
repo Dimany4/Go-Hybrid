@@ -953,7 +953,7 @@ impl<'a> Checker<'a> {
                 self.check_typed_const_arith(rhs, st);
                 use hy_syntax::BinOp::*;
                 let is_shift = matches!(op, Shl | Shr);
-                let arith = matches!(op, Add | Sub | Mul | Div | Rem | Shl | Shr);
+                let arith = matches!(op, Add | Sub | Mul | Div | Mod | Shl | Shr);
                 if !arith {
                     return;
                 }
@@ -1254,9 +1254,9 @@ impl<'a> Checker<'a> {
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let t = if is_shift { lt? } else { lt.or(rt)? };
                 let (lo, hi) = fixed_width_int_range(&t.ty)?;
-                let l = self.const_value_of(lhs, st);
-                let r = self.const_value_of(rhs, st);
-                match fold_bin(op, l, r) {
+                let l = self.typed_const_value_of(lhs, st);
+                let r = self.typed_const_value_of(rhs, st);
+                match fold_bin(*op, l, r) {
                     ConstFold::Val(v) if v >= lo && v <= hi => Some(TypedConst {
                         val: v,
                         ty: t.ty,
