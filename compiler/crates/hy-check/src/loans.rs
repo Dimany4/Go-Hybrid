@@ -3417,13 +3417,31 @@ impl<'a> Checker<'a> {
                     out,
                 );
                 for (k, v) in body_aliases {
-                    if aliases.contains_key(&k) {
+                    // Issue #854: merge aliases for live locals even if `Stmt::Local`
+                    // evicted them from `aliases` before the loop (e.g. `var tmp ...`).
+                    if aliases.contains_key(&k) || cst.env_lookup(&k).is_some() {
                         aliases.entry(k).or_default().extend(v);
                     }
                 }
             }
             Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
-                self.walk_block_param_stores(body, cst, aliases, param_names, depth, out);
+                // Issue #854: isolate the block scope so an inner shadow
+                // (`{ src := ... }`) cannot erase the outer parameter's aliases.
+                let mut block_cst = cst.clone();
+                let mut block_aliases = aliases.clone();
+                self.walk_block_param_stores(
+                    body,
+                    &mut block_cst,
+                    &mut block_aliases,
+                    param_names,
+                    depth,
+                    out,
+                );
+                for (k, v) in block_aliases {
+                    if aliases.contains_key(&k) || cst.env_lookup(&k).is_some() {
+                        aliases.entry(k).or_default().extend(v);
+                    }
+                }
             }
             Stmt::Match { subject, arms, .. } => {
                 let subj_origins = self.expr_slot_origins(cst, subject, aliases);
@@ -3464,7 +3482,9 @@ impl<'a> Checker<'a> {
                         out,
                     );
                     for (k, v) in arm_aliases {
-                        if aliases.contains_key(&k) {
+                        // Issue #854: merge aliases for live locals even if `Stmt::Local`
+                        // evicted them from `aliases` before the match arm (e.g. `var tmp ...`).
+                        if aliases.contains_key(&k) || cst.env_lookup(&k).is_some() {
                             aliases.entry(k).or_default().extend(v);
                         }
                     }
@@ -3483,7 +3503,9 @@ impl<'a> Checker<'a> {
                         out,
                     );
                     for (k, v) in arm_aliases {
-                        if aliases.contains_key(&k) {
+                        // Issue #854: merge aliases for live locals even if `Stmt::Local`
+                        // evicted them from `aliases` before the select arm (e.g. `var tmp ...`).
+                        if aliases.contains_key(&k) || cst.env_lookup(&k).is_some() {
                             aliases.entry(k).or_default().extend(v);
                         }
                     }
