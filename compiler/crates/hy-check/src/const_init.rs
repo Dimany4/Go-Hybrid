@@ -189,7 +189,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn file_const_decl(&self, name: &str) -> Option<&hy_syntax::ConstDecl> {
+    pub(crate) fn file_const_decl(&self, name: &str) -> Option<&hy_syntax::ConstDecl> {
         self.file.decls.iter().find_map(|d| match d {
             Decl::Const(c) if c.name == name => Some(c),
             _ => None,

@@ -23,9 +23,11 @@
 //! and the closure walk (closures.rs — FnLit bodies sit outside the flat
 //! walk, the A5 perimeter).
 
+use crate::const_overflow::{const_int_fold_with, fixed_width_int_range, ConstFold};
 use crate::model::{unwrap_parens, Checker, FnState, TypeShape};
 use hy_diag::{Diagnostic, Span};
 use hy_syntax::{Expr, ForKind, LitKind, Stmt, TypeExpr};
+use std::collections::HashMap;
 
 impl<'a> Checker<'a> {
     /// Statement entry: classify the iterable of every `for x in e` and the
@@ -95,14 +97,211 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::For {
-                kind: ForKind::Range { var, lo, hi, .. },
+                kind:
+                    ForKind::Range {
+                        var,
+                        lo,
+                        hi,
+                        inclusive,
+                        ..
+                    },
                 ..
             } => {
                 self.check_integer_range_bound(st, var, lo);
                 self.check_integer_range_bound(st, var, hi);
+                self.check_range_bound_types(st, lo, hi, *inclusive);
             }
             _ => {}
         }
+    }
+    /// Bypasses 3 and 4 from issue #827:
+    /// 3. Mismatched integer types between `lo` and `hi`
+    ///    (`for i in 0..n` where `n: u32`, `for i in lo..hi` where `lo: i32`
+    ///    and `hi: i64`, etc.).
+    /// 4. Constant integer bounds that overflow the loop counter's integer
+    ///    type (`for i in 0..(1 << 63)`, `var lo i8 = 0; for i in lo..300`).
+    fn check_range_bound_types(&mut self, st: &FnState, lo: &Expr, hi: &Expr, inclusive: bool) {
+        let lo_ty = self.range_bound_int_type(st, lo);
+        let hi_ty = self.range_bound_int_type(st, hi);
+
+        // Both bounds carry concrete integer types: the emitted Go compares
+        // two typed values, and Go rejects `int` vs `uint32` / `i32` vs
+        // `i64` comparisons outright.
+        if let (Some(lt), Some(ht)) = (&lo_ty, &hi_ty) {
+            if lt != ht {
+                self.emit_range_bound_mismatch(lo, hi, lt, ht);
+                return;
+            }
+        }
+
+        // Mixed typed/untyped bounds. An untyped bound is a constant, so:
+        //   * exclusive (`for i := lo; i < hi; i++`): the counter `i` takes
+        //     lo's type — or Go's default `int` when lo is untyped — and a
+        //     typed `hi` of any other type makes `i < hi` a Go mismatch
+        //     (`for i in 0..n` with `n: u32`);
+        //   * inclusive (`hyLo := lo; hyHi := hi; … hyLo <= hyHi`): both
+        //     bounds become independent variables, and an untyped constant
+        //     gets the default type `int`, so a non-`int` typed bound next
+        //     to an untyped one rejects (`for i in lo..=10`, `lo: i64`).
+        match (&lo_ty, &hi_ty) {
+            (Some(lt), None) => {
+                if inclusive && lt != "int" {
+                    self.emit_range_bound_mismatch(lo, hi, lt, "int");
+                    return;
+                }
+            }
+            (None, Some(ht)) => {
+                if ht != "int" {
+                    self.emit_range_bound_mismatch(lo, hi, "int", ht);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        // Bypass 4: constant bounds that overflow the counter's integer
+        // type. The effective counter type is the typed side when there is
+        // one, and Go's default `int` for all-untyped bounds
+        // (`for i in 0..(1 << 63)`).
+        let counter_ty = lo_ty
+            .clone()
+            .or_else(|| hi_ty.clone())
+            .unwrap_or_else(|| "int".to_string());
+        for (bound_expr, bound_ty) in [(lo, lo_ty.as_deref()), (hi, hi_ty.as_deref())] {
+            // A typed bound is compared at its own type; an untyped constant
+            // bound adopts the counter's type.
+            let Some(target_ty) = bound_ty.or(Some(counter_ty.as_str())) else {
+                continue;
+            };
+            let Some((bmin, bmax)) = fixed_width_int_range(target_ty) else {
+                continue;
+            };
+            // The const map borrows `self`, so every fold happens inside this
+            // scope and only the owned verdict outlives it — the push below
+            // needs `&mut self.diags`.
+            let verdict = {
+                let consts = self.collect_const_map(st);
+                let mut folded = const_int_fold_with(bound_expr, &consts, 0, Some(st));
+                if let ConstFold::NotConst = folded {
+                    // Block-scoped `const` identifiers are not in the
+                    // file-level map; resolve them at the use site.
+                    folded = match unwrap_parens(bound_expr) {
+                        Expr::Ident { name, span, .. } => {
+                            match self.resolve_local_const_decl_at(name, span.start) {
+                                Some((_ty, val, _pos)) => {
+                                    const_int_fold_with(val, &consts, 0, None)
+                                }
+                                None => ConstFold::NotConst,
+                            }
+                        }
+                        _ => ConstFold::NotConst,
+                    };
+                }
+                match folded {
+                    ConstFold::Val(v) if v < bmin || v > bmax => Some((
+                        format!(
+                            "constant `{}` overflows the `{}` loop counter bound (HYB-E2009)",
+                            bound_expr.render(),
+                            target_ty
+                        ),
+                        "why: the emitted Go rejects a constant outside the loop counter's fixed-width type (`constant … overflows …`), so an accepted Hybrid program would emit unbuildable Go".to_string(),
+                        format!(
+                            "fix: use a constant representable in `{}` (range {}..={})",
+                            target_ty, bmin, bmax
+                        ),
+                    )),
+                    ConstFold::TooBig => Some((
+                        format!(
+                            "constant `{}` is too large for the `{}` loop counter bound (HYB-E2009)",
+                            bound_expr.render(),
+                            target_ty
+                        ),
+                        "why: the constant's magnitude exceeds every fixed-width Hybrid integer range, so the emitted Go rejects it".to_string(),
+                        "fix: reduce the constant expression or bind the bound to a local variable first".to_string(),
+                    )),
+                    _ => None,
+                }
+            };
+            if let Some((msg, why, fix)) = verdict {
+                let span = bound_expr.span();
+                let notes = vec![why, fix];
+                self.diags.push(
+                    Diagnostic::error("HYB-E2009", self.path.clone(), span, msg)
+                        .with_notes(notes),
+                );
+            }
+        }
+    }
+
+    /// Emits the shared mismatch diagnostic for `check_range_bound_types`.
+    fn emit_range_bound_mismatch(&mut self, lo: &Expr, hi: &Expr, lt: &str, ht: &str) {
+        let span = hy_diag::Span {
+            start: lo.span().start,
+            end: hi.span().end,
+        };
+        let msg = format!(
+            "`for i in {}..{}` — bounds have mismatched integer types (`{}` vs `{}`); `go build` rejects the comparison (HYB-E2009)",
+            lo.render(),
+            hi.render(),
+            lt,
+            ht
+        );
+        let notes = vec![
+            "why: the emitted Go comparison requires identical integer types on both sides; an untyped constant bound adopts Go's default type `int`".to_string(),
+            "fix: align the bound types (e.g. `for i in u32(0)..n`, or declare the bounds with matching `var` types)".to_string(),
+        ];
+        self.diags.push(
+            Diagnostic::error("HYB-E2009", self.path.clone(), span, msg).with_notes(notes),
+        );
+    }
+    /// Resolves the CONCRETE integer type of a range bound (`u32`, `i64`,
+    /// `byte`, ...). Untyped operands — integer literals, unary negation of
+    /// them, untyped `const` identifiers — have no concrete type here
+    /// (Go adopts the other side's type, or the default `int` for the
+    /// counter), so they return None; the default-type rules live in
+    /// `check_range_bound_types`. Returns None if the bound is not a
+    /// resolved integer.
+    fn range_bound_int_type(&self, st: &FnState, expr: &Expr) -> Option<String> {
+        match unwrap_parens(expr) {
+            Expr::Ident { name, .. } => {
+                if let Some(b) = st.env_lookup(name) {
+                    if let Some(ty) = &b.ty {
+                        let resolved = self.resolve_type_alias(ty);
+                        if let TypeExpr::Named { name: tn, .. } = &resolved {
+                            // Every fixed-width spelling (u8/uint8/byte,
+                            // rune, int, uint, ...) — the emitted Go
+                            // comparison must match Go's types exactly.
+                            if fixed_width_int_range(tn).is_some() {
+                                return Some(tn.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(ty) = self.ty_of_expr(st, expr) {
+            let resolved = self.resolve_type_alias(&ty);
+            if let TypeExpr::Named { name, .. } = &resolved {
+                if fixed_width_int_range(name).is_some() {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Collects a map of file-level and block-scoped constants (name -> value)
+    /// for use in constant folding (`const_int_fold_with`).
+    fn collect_const_map(&self, st: &FnState) -> HashMap<String, &Expr> {
+        let mut map = HashMap::new();
+        for d in &self.file.decls {
+            if let hy_syntax::Decl::Const(c) = d {
+                map.insert(c.name.clone(), &c.value);
+            }
+        }
+        let _ = st;
+        map
     }
 
     fn check_integer_range_bound(&mut self, st: &FnState, var: &str, bound: &Expr) {
@@ -139,16 +338,54 @@ impl<'a> Checker<'a> {
                 ..
             }
             | Expr::Interp { .. } => return Some("string".to_string()),
-            Expr::Unary { operand, .. } => {
-                if let Some(k) = self.non_integer_bound_kind(st, operand) {
-                    return Some(k);
+            Expr::Lit {
+                kind: LitKind::Nil,
+                ..
+            } => return Some("nil".to_string()),
+            Expr::Unary { op, .. } if matches!(op, hy_syntax::UnOp::Not) => {
+                return Some("bool".to_string());
+            }
+            Expr::Unary { op, .. } if matches!(op, hy_syntax::UnOp::Addr) => {
+                return Some("pointer".to_string());
+            }
+            Expr::AddrOf { .. } => return Some("pointer".to_string()),
+            Expr::Binary { op, .. } => {
+                if matches!(
+                    op,
+                    hy_syntax::BinOp::Eq
+                        | hy_syntax::BinOp::Ne
+                        | hy_syntax::BinOp::Lt
+                        | hy_syntax::BinOp::Gt
+                        | hy_syntax::BinOp::Le
+                        | hy_syntax::BinOp::Ge
+                        | hy_syntax::BinOp::And
+                        | hy_syntax::BinOp::Or
+                ) {
+                    return Some("bool".to_string());
                 }
             }
-            Expr::Binary { lhs, rhs, .. } => {
-                if let Some(k) = self
-                    .non_integer_bound_kind(st, lhs)
-                    .or_else(|| self.non_integer_bound_kind(st, rhs))
+            Expr::Ident { name, span } => {
+                if name == "nil" {
+                    return Some("nil".to_string());
+                }
+                if name == "true" || name == "false" {
+                    return Some("bool".to_string());
+                }
+                if let Some(c) = self.file_const_decl(name) {
+                    if let Some(k) = self.non_integer_bound_kind(st, &c.value) {
+                        return Some(k);
+                    }
+                }
+                if let Some((_ty, val, _pos)) =
+                    self.resolve_local_const_decl_at(name, span.start)
                 {
+                    if let Some(k) = self.non_integer_bound_kind(st, val) {
+                        return Some(k);
+                    }
+                }
+            }
+            Expr::Unary { operand, .. } => {
+                if let Some(k) = self.non_integer_bound_kind(st, operand) {
                     return Some(k);
                 }
             }

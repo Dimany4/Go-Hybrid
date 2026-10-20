@@ -1545,6 +1545,20 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// Issue #827 (bypass 2): block-scoped `const` resolution for range
+    /// bounds. Same span-scoped scan as this module's constant folding, but
+    /// narrowed back to a `const` binding: only those expose the initializer
+    /// the range-bound folds may evaluate.
+    pub(crate) fn resolve_local_const_decl_at(
+        &self,
+        name: &str,
+        use_pos: hy_diag::Pos,
+    ) -> Option<(&'a Option<TypeExpr>, &'a Expr, hy_diag::Pos)> {
+        let sight = self.resolve_local_binding_at(name, use_pos)?;
+        let value = sight.constant_initializer()?;
+        Some((sight.ty, value, sight.pos))
+    }
+
     /// Length of the fixed-size array that `expr` denotes, when it is known
     /// exactly.
     ///
