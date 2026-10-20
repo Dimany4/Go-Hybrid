@@ -523,7 +523,9 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         ck.check_addr_of_loan(&st, &uses);
         // T24 + O8: a live slot loan cannot be re-bound to a general
         // pointer — the loan lowers to a copy + store-back (HYB-E3104).
-        ck.check_slot_loan_rebind(&st, stmt);
+        // Issue #831: also rejects rebinding the loan's *base* binding
+        // (HYB-E3102) while the loan is live.
+        ck.check_slot_loan_rebind(&st, stmt, idx);
 
         let mut fnlits = Vec::new();
         walk::own_fnlits(stmt, &mut fnlits);

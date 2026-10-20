@@ -17,7 +17,7 @@
 //! the A3 loan). The flag lives on the `Binding`, so a shadowing
 //! redefinition in an inner block starts clean (no false rejects).
 
-use crate::model::{as_addr_of, unwrap_parens, Checker, FnState, TypeShape};
+use crate::model::{as_addr_of, unwrap_parens, Checker, FnState, LoanTarget, TypeShape};
 use crate::walk::{self, Use};
 use hy_diag::{Diagnostic, FixIt, Span};
 use hy_syntax::{AssignOp, Expr, ForKind, InterpPart, LocalDecl, Place, PlaceKind, SelectArmKind, Stmt};
@@ -29,7 +29,13 @@ fn is_slot_loan_expr(e: &Expr) -> bool {
     let Some(inner) = as_addr_of(unwrap_parens(e)) else {
         return false;
     };
-    matches!(unwrap_parens(inner), Expr::Index { .. })
+    // O8 slot loans: both map-slot (`&m[k]`) and field-projected (`&h.sub`,
+    // `&s[0].sub`) address-of expressions lower to copy-out + deferred
+    // store-back in hy-emit, so both must be tracked as slot loans here.
+    matches!(
+        unwrap_parens(inner),
+        Expr::Index { .. } | Expr::Field { .. }
+    )
 }
 
 impl<'a> Checker<'a> {
@@ -77,7 +83,7 @@ impl<'a> Checker<'a> {
     /// cannot build, or — for a pointer-typed binding — makes the
     /// store-back write the new pointee into the map slot. Runs BEFORE
     /// `mark_slot_loans_assign` so it sees the binding's prior form.
-    pub(crate) fn check_slot_loan_rebind(&mut self, st: &FnState, stmt: &Stmt) {
+    pub(crate) fn check_slot_loan_rebind(&mut self, st: &FnState, stmt: &Stmt, current_idx: usize) {
         let Stmt::Assign {
             targets,
             op: AssignOp::Assign,
@@ -121,6 +127,39 @@ impl<'a> Checker<'a> {
                 replacement: None,
             }];
             self.diags.push(d);
+        }
+        // O8 (issue #831): rebinding a loaned base binding (the path root of
+        // a live `LoanTarget::MapSlot`) while the loan is live invalidates
+        // the loan's deferred store-back. The emitter lowers the loan's last
+        // use to a store-back on the base binding, so reassigning the base
+        // would point that store-back at the new map/slice — corrupting it,
+        // or racing a concurrent task that just moved the old value.
+        for loan in &st.loans {
+            let LoanTarget::MapSlot { path, .. } = &loan.target else {
+                continue;
+            };
+            let root = path.split('.').next().unwrap_or(path);
+            for t in targets {
+                let PlaceKind::Ident(name) = &t.kind else {
+                    continue;
+                };
+                if name != root || current_idx > loan.last {
+                    continue;
+                }
+                let msg = format!(
+                    "`{} = ...` re-binds the base of a live map-slot loan: the loan's deferred store-back still targets this binding (HYB-E3102)",
+                    name
+                );
+                let mut d = Diagnostic::error("HYB-E3102", self.path.clone(), t.span, msg).with_notes(vec![
+                    format!("the loan's last use lowers to a store-back `{path}[...] = ...` on this binding; reassigning `{name}` here would send that store-back to the new map/slice"),
+                    "move or rebind the loan first (its whole binding), or drop the loan before reassigning the base".to_string(),
+                ]);
+                d.fixits = vec![FixIt {
+                    description: "re-assign the loan variable itself, or finish using the loan (its last use) before rebinding the base".to_string(),
+                    replacement: None,
+                }];
+                self.diags.push(d);
+            }
         }
     }
 
@@ -492,5 +531,95 @@ impl<'a> Checker<'a> {
             replacement: None,
         }];
         self.diags.push(d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{check_file, Verdict};
+
+    fn check(src: &str) -> crate::CheckResult {
+        let ast = hy_syntax::parse_file("test.hy", src).expect("test source must parse");
+        check_file(&ast)
+    }
+
+    /// Issue #831: rebinding the BASE of a live map-slot loan (`m = ...`
+    /// while `n := &m["a"]` is live) must reject with HYB-E3102 — the
+    /// loan's last use lowers to a store-back `m["a"] = n` on the base
+    /// binding, which would otherwise write into whatever `m` was rebound
+    /// to (data race after `task worker(move m)`).
+    #[test]
+    fn rebind_of_loaned_base_rejected_e3102() {
+        let r = check(
+            "struct item { x int }\n\
+             fn main() {\n\
+               m := map[string]item{\"a\": item{x: 1}}\n\
+               n := &m[\"a\"]\n\
+               m = map[string]item{\"a\": item{x: 2}}\n\
+               n.x = 99\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E3102"),
+            "expected HYB-E3102, got {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// Negative control: once the loan is finished (its last use is behind
+    /// us), rebinding the base is safe and must stay accepted.
+    #[test]
+    fn rebind_of_loaned_base_accepted_after_loan_last_use() {
+        let r = check(
+            "struct item { x int }\n\
+             fn main() {\n\
+               m := map[string]item{\"a\": item{x: 1}}\n\
+               n := &m[\"a\"]\n\
+               n.x = 99\n\
+               m = map[string]item{\"a\": item{x: 2}}\n\
+               _ = m\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Classic O8 control: a plain map-slot loan written through its field
+    /// stays accepted — the new base-rebind check must not false-positive
+    /// on the normal loan lifecycle.
+    #[test]
+    fn plain_map_slot_loan_lifecycle_still_accepted() {
+        let r = check(
+            "struct item { x int }\n\
+             fn main() {\n\
+               m := map[string]item{\"a\": item{x: 1}}\n\
+               n := &m[\"a\"]\n\
+               n.x = 99\n\
+               _ = m\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    /// Field-projected slot loans (`&s[0].sub`) are tracked like `&m[k]`:
+    /// taking the address of such a loan (`p := &n`) is T24 (HYB-E3104).
+    #[test]
+    fn field_projected_slot_loan_addr_of_rejected_e3104() {
+        let r = check(
+            "struct sub { x int }\n\
+             struct item { sub sub }\n\
+             fn main() {\n\
+               s := []item{item{sub: sub{x: 1}}}\n\
+               n := &s[0].sub\n\
+               p := &n\n\
+               _ = p\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.code == "HYB-E3104"),
+            "expected HYB-E3104, got {:?}",
+            r.diagnostics
+        );
     }
 }
