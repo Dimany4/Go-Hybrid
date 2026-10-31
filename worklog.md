@@ -924,3 +924,17 @@ Session-18 (2026-10-30, full-throttle merge day — cron re-pointed to this queu
 - WRITTEN REPLIES: #2492/#2499/#2299 landings, #2389/#2388 evidence. No silent anything.
 - Suite trajectory: 184 -> 185. Final main 7440766, ls-remote == HEAD, tree clean.
 - NEXT TICK QUEUE: #2389/#2388 (await one-line fix), #2310 (N5 zero maps, +145/14), #2425 (autoland, 0-behind again), #1811/#1780/#1766/#1767 (9xj89gzrtw-hue batch), #2290 (Yumihariii method-value arity), #2390 (O8 slot-loan snapshot), #2438 (escape_sites nesting), #2288 (+292/11), #2451 (borrow_ffi spike).
+
+## Session 29 — 2026-10-31 night (tick 487193: 5 landed, 0 gate-fails)
+
+- Sandbox recycled (10th; target cache wiped — cold rebuild inside first verify, warm thereafter). cwd resets between tool calls in this sandbox: every command re-cd's hybrid (a merge/push briefly hit the parent repo — both failed harmlessly, parent untouched).
+- Scan: approve 40/117. Pareto NOW worked top-down.
+- LANDED:
+  b4a6251 Merge PR #787 (ocakciomursel-pixel, fixes #727) — fn-type result lists line-bounded via same_line_as_prev(); +1 parse test; fn_type_result_line_{cases,fixture,schema}.json triplet (convention, not battery-consumed). 185 suites.
+  0d729a3 Merge PR #1713 (ryder777777) — elided pointer-struct literals emit &T{...} (Pointer expected-type branch) + map keys via emit_expr_exp(.., Some(key)); go-run integration test elided_struct_lit_emit.rs. 186 suites. NOTE: pr-1713 based on 3fb88d2; `git diff main pr-X` shows base artifacts (read vs merge-base instead).
+  44c9ff8 Merge PR #2488 (ocakciomursel-pixel, fixes #2487) — shepherd setup/preflight/verify aligned with compiler//runtime/ worktrees; criterion test_shepherd_gate.py 12/12 on PR tree; preflight go leg emulated locally (synthesized hybrid.program module: go build+vet PASS; hyrt staticlib confirmed). 186 suites.
+  10c658b Merge PR #2302 (ocakciomursel-pixel, fixes #730) — exclusive range bounds hoist once (hyHi) when shadowed or call/recv, mirroring inclusive hi_once; +1 test. 187 suites.
+  0cd551e Merge PR #1725 (ryder777777, fixes #1724) — classify_make_size: named consts fold via const_int_fold_with, in-scope vars NonLiteral via new expr_mentions_bound, Overflow arm HYB-E2005; check_stmt_builtins takes FnState. 188 suites.
+- All five: merge gate CLEAN, tripwire not fired, differential FULL 41/41+88/88, ls-remote==HEAD asserted, written landing replies posted (#787 #1713 #2488 #2302 #1725).
+- Suite trajectory: 185 -> 188. Differential unchanged. Final main 0cd551e, tree clean.
+- NEXT TICK QUEUE: #1709 (option match arm guards/order), #2305 (shepherd verify-assert git fetch), #2306 (hyb generate fail-closed ownership), #2389/#2388 (await API-drift fix), #2310 (N5 zero maps), #2425 (autoland), #1811/#1780/#1766/#1767 (hue batch), #2513/#2530/#2486/#2503/#2494 (new ocakciomursel-pixel + theheiszt arrivals), #1715 (wildcard spike).
