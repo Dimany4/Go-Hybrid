@@ -1,5 +1,5 @@
 //! Issue #2382: `check_deferred_uses` (`HYB-E3003`) catches `select` move-sends
-//! (`case ch <- move shared:`) and expression/control-flow moves (`consume(move shared)`).
+//! (`ch <- move shared:`) and expression/control-flow moves (`consume(move shared)`).
 
 fn codes(src: &str) -> Vec<String> {
     let file = hy_syntax::parse_file("t.hy", src).expect("parse");
@@ -33,7 +33,7 @@ fn via_select() {
     shared := map[string]int{"k": 1}
     defer report(shared)
     select {
-    case ch <- move shared:
+        ch <- move shared:
     }
 }
 
