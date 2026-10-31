@@ -4,6 +4,7 @@
 fn codes(src: &str) -> Vec<String> {
     let file = hy_syntax::parse_file("t.hy", src).expect("parse");
     hy_check::check_file(&file)
+        .diagnostics
         .into_iter()
         .map(|d| d.code.to_string())
         .collect()
