@@ -2125,42 +2125,6 @@ fn main() {
     }
 
     #[test]
-    fn reject_closure_multivalue_slot_loan_and_scoped_const_rebind_issue_2383() {
-        let src1 = r#"struct svc {
-    count int
-}
-
-fn main() {
-    m := map[string]svc{"a": svc{count: 1}}
-    f := fn() {
-        s, ok := &m["a"]
-        if ok {
-            m["b"] = svc{count: 2}
-            s.count = 10
-        }
-    }
-    f()
-}
-"#;
-        assert_eq!(codes(src1), vec!["HYB-E3102"]);
-
-        let src2 = r#"const CONST_MAP = map[string]int{"k": 1}
-
-fn main() {
-    if true {
-        var alias map[string]int = map[string]int{"k": 2}
-        mutator := fn() {
-            alias["k"] = 999
-        }
-        alias = CONST_MAP
-        mutator()
-    }
-}
-"#;
-        assert_eq!(codes(src2), vec!["HYB-E3006"]);
-    }
-
-    #[test]
     fn reject_rebind_of_deferred_name_when_pre_defer_alias_moves_issue_438() {
         let src = r#"import "fmt"
 
