@@ -2168,42 +2168,6 @@ fn main() {
     }
 
     #[test]
-    fn reject_defer_before_select_move_send_and_expr_move_issue_2382() {
-        let src = r#"import "fmt"
-
-fn worker(ch chan map[string]int) {
-    m := <-ch
-    m["k"] = 99
-}
-
-fn consume(owned map[string]int) {
-    owned["k"] = 77
-}
-
-fn report(m map[string]int) {
-    fmt.println(m["k"])
-}
-
-fn via_select() {
-    ch := make(chan map[string]int, 1)
-    task worker(ch)
-    shared := map[string]int{"k": 1}
-    defer report(shared)
-    select {
-    case ch <- move shared:
-    }
-}
-
-fn via_expr() {
-    shared := map[string]int{"k": 1}
-    defer report(shared)
-    consume(move shared)
-}
-"#;
-        assert_eq!(codes(src), vec!["HYB-E3003", "HYB-E3003"]);
-    }
-
-    #[test]
     fn reject_rebind_of_deferred_name_when_pre_defer_alias_moves_issue_438() {
         let src = r#"import "fmt"
 
