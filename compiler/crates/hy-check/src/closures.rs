@@ -1242,6 +1242,24 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             ck.extend_map_slot_loan_to_alias(st, name, val, idx);
                         }
                     }
+                } else if l.values.len() == 1 && l.names.len() == 2 {
+                    let val = &l.values[0];
+                    if let Some(path) = walk::addr_of_index_base_path(val) {
+                        let binding = l.names[0].clone();
+                        let key = walk::addr_of_index_slot_key(val);
+                        let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
+                        st.loans.push(Loan {
+                            target: LoanTarget::MapSlot {
+                                binding: binding.clone(),
+                                path,
+                                key,
+                            },
+                            created: idx,
+                            last,
+                            span: val.span(),
+                            desc: format!("`{} := {}`", l.names.join(", "), val.render()),
+                        });
+                    }
                 }
             }
             Stmt::Assign {
@@ -1274,11 +1292,40 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             }
                         }
                     }
+                } else if *op == hy_syntax::AssignOp::Assign
+                    && values.len() == 1
+                    && targets.len() == 2
+                {
+                    let v = &values[0];
+                    if let hy_syntax::PlaceKind::Ident(name) = &targets[0].kind {
+                        if let Some(path) = walk::addr_of_index_base_path(v) {
+                            let binding = name.clone();
+                            let key = walk::addr_of_index_slot_key(v);
+                            let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
+                            st.loans.push(Loan {
+                                target: LoanTarget::MapSlot {
+                                    binding: binding.clone(),
+                                    path,
+                                    key,
+                                },
+                                created: idx,
+                                last,
+                                span: v.span(),
+                                desc: format!("`{} = {}`", binding, v.render()),
+                            });
+                        }
+                    }
                 }
                 for t in targets {
                     if matches!(t.kind, hy_syntax::PlaceKind::Index { .. }) {
                         if let Some(path) = walk::place_path(t) {
                             ck.emit_a3_if_live_pub(st, &path, t.span, idx, "insert");
+                        }
+                    } else if *op == hy_syntax::AssignOp::Assign {
+                        if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                            ck.emit_a3_if_live_pub(st, name, t.span, idx, "rebind");
+                        } else if let Some(path) = walk::place_path(t) {
+                            ck.emit_a3_if_live_pub(st, &path, t.span, idx, "rebind");
                         }
                     }
                 }
@@ -2075,6 +2122,42 @@ fn main() {
 }
 "#;
         assert!(codes(src).is_empty());
+    }
+
+    #[test]
+    fn reject_closure_multivalue_slot_loan_and_scoped_const_rebind_issue_2383() {
+        let src1 = r#"struct svc {
+    count int
+}
+
+fn main() {
+    m := map[string]svc{"a": svc{count: 1}}
+    f := fn() {
+        s, ok := &m["a"]
+        if ok {
+            m["b"] = svc{count: 2}
+            s.count = 10
+        }
+    }
+    f()
+}
+"#;
+        assert_eq!(codes(src1), vec!["HYB-E3102"]);
+
+        let src2 = r#"const CONST_MAP = map[string]int{"k": 1}
+
+fn main() {
+    if true {
+        var alias map[string]int = map[string]int{"k": 2}
+        mutator := fn() {
+            alias["k"] = 999
+        }
+        alias = CONST_MAP
+        mutator()
+    }
+}
+"#;
+        assert_eq!(codes(src2), vec!["HYB-E3006"]);
     }
 
     #[test]
