@@ -1934,13 +1934,103 @@ fn stmt_moves_watched_binding(
         }
         Stmt::Select { arms, .. } => {
             for arm in arms {
-                if let SelectArmKind::Send { chan, value, .. } = &arm.kind {
-                    let desc = format!(
-                        "the select move-send `{} <- {}`",
-                        chan.render(),
-                        value.render()
-                    );
-                    if let Some(mv) = check_expr(value, desc) {
+                match &arm.kind {
+                    SelectArmKind::Send {
+                        chan,
+                        value,
+                        is_move,
+                    } => {
+                        let cdesc = format!("the select-send target `{}`", chan.render());
+                        if let Some(mv) = check_expr(chan, cdesc) {
+                            return Some(mv);
+                        }
+                        let desc = format!(
+                            "the select move-send `{} <- {}`",
+                            chan.render(),
+                            if *is_move && !matches!(value, Expr::Move { .. }) {
+                                format!("move {}", value.render())
+                            } else {
+                                value.render()
+                            }
+                        );
+                        if *is_move {
+                            if let Expr::Ident { name, .. } = crate::model::unwrap_parens(value) {
+                                if watch.contains(name) {
+                                    return Some(crate::model::MoveInfo {
+                                        span: chan.span().to(value.span()),
+                                        kind: crate::model::MoveKind::Moved,
+                                        desc,
+                                        moved_name: name.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(mv) = check_expr(value, desc) {
+                            return Some(mv);
+                        }
+                    }
+                    SelectArmKind::Recv { chan, .. } => {
+                        let cdesc = format!("the select-recv `{}`", chan.render());
+                        if let Some(mv) = check_expr(chan, cdesc) {
+                            return Some(mv);
+                        }
+                    }
+                    SelectArmKind::Default => {}
+                }
+            }
+        }
+        Stmt::Expr { expr, .. } => {
+            let desc = format!("the expression `{}`", expr.render());
+            if let Some(mv) = check_expr(expr, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::Defer { call, .. } => {
+            let desc = format!("the deferred call `defer {}`", call.render());
+            if let Some(mv) = check_expr(call, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::If { cond, .. } => {
+            let desc = format!("the condition `{}`", cond.render());
+            if let Some(mv) = check_expr(cond, desc) {
+                return Some(mv);
+            }
+        }
+        Stmt::For { kind, .. } => match kind {
+            hy_syntax::ForKind::Iterate { expr, .. } => {
+                let desc = format!("the loop header `{}`", expr.render());
+                if let Some(mv) = check_expr(expr, desc) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::Range { lo, hi, .. } => {
+                let d_lo = format!("the range bound `{}`", lo.render());
+                if let Some(mv) = check_expr(lo, d_lo) {
+                    return Some(mv);
+                }
+                let d_hi = format!("the range bound `{}`", hi.render());
+                if let Some(mv) = check_expr(hi, d_hi) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::While { cond } => {
+                let desc = format!("the loop condition `{}`", cond.render());
+                if let Some(mv) = check_expr(cond, desc) {
+                    return Some(mv);
+                }
+            }
+            hy_syntax::ForKind::Infinite => {}
+        },
+        Stmt::Match { subject, arms, .. } => {
+            let desc = format!("the match subject `{}`", subject.render());
+            if let Some(mv) = check_expr(subject, desc) {
+                return Some(mv);
+            }
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    let gdesc = format!("the match guard `{}`", g.render());
+                    if let Some(mv) = check_expr(g, gdesc) {
                         return Some(mv);
                     }
                 }
@@ -2075,6 +2165,42 @@ fn main() {
 }
 "#;
         assert!(codes(src).is_empty());
+    }
+
+    #[test]
+    fn reject_defer_before_select_move_send_and_expr_move_issue_2382() {
+        let src = r#"import "fmt"
+
+fn worker(ch chan map[string]int) {
+    m := <-ch
+    m["k"] = 99
+}
+
+fn consume(owned map[string]int) {
+    owned["k"] = 77
+}
+
+fn report(m map[string]int) {
+    fmt.println(m["k"])
+}
+
+fn via_select() {
+    ch := make(chan map[string]int, 1)
+    task worker(ch)
+    shared := map[string]int{"k": 1}
+    defer report(shared)
+    select {
+    case ch <- move shared:
+    }
+}
+
+fn via_expr() {
+    shared := map[string]int{"k": 1}
+    defer report(shared)
+    consume(move shared)
+}
+"#;
+        assert_eq!(codes(src), vec!["HYB-E3003", "HYB-E3003"]);
     }
 
     #[test]
