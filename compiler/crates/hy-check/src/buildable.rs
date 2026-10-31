@@ -428,11 +428,14 @@ struct Collector<'a> {
     kind_scopes: Vec<HashMap<String, OpKind>>,
     /// File-level `const` kinds (#425).
     file_consts: HashMap<String, OpKind>,
-    /// Names of fn-local constants (`const k = 2`, `const k int = 2`) — #2577.
-    /// Consts never enter `scopes` (that table tracks `:=`/`let` binding reads),
-    /// so the channel-send operand check needs its own record: a constant keeps
-    /// the `(Float, Int)` direction fail-open.
-    const_names: std::collections::HashSet<String>,
+    /// Names of fn-local constants declared WITHOUT a type ascription
+    /// (`const k = 2`) — #2577. A *typed* constant (`const k int = 2`) is a
+    /// different thing in Go: it cannot be sent to a `chan float64`, while the
+    /// untyped one can. Consts never enter `scopes` (that table tracks `:=`/`let`
+    /// binding reads), so the channel-send operand check keeps its own record.
+    untyped_const_names: std::collections::HashSet<String>,
+    /// File-level constants declared without a type ascription (`const k = 2`).
+    file_untyped_consts: std::collections::HashSet<String>,
     /// Depth of enclosing `managed(...)` blocks — the audited escape hatch. The
     /// send operand-kind check (#2577) stands down inside one, exactly like the
     /// boundary rules: the hatch is where the human takes responsibility, and
@@ -473,7 +476,8 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
             scopes: Vec::new(),
             kind_scopes: Vec::new(),
             file_consts: HashMap::new(),
-            const_names: std::collections::HashSet::new(),
+            untyped_const_names: std::collections::HashSet::new(),
+            file_untyped_consts: std::collections::HashSet::new(),
             managed_depth: 0,
             fn_results: Vec::new(),
             fn_results_all_named: false,
@@ -493,6 +497,11 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
                     .map(|t| c.kind_of_ty(t, 0))
                     .unwrap_or_else(|| c.kind_of_expr(&cd.value));
                 c.file_consts.insert(cd.name.clone(), k);
+                if cd.ty.is_none() {
+                    // A file-level `const k = 2` is untyped and convertible to a
+                    // float target; `const k int = 2` is not (#2577).
+                    c.file_untyped_consts.insert(cd.name.clone());
+                }
             }
         }
         for d in &file.decls {
@@ -846,13 +855,13 @@ impl<'a> Collector<'a> {
     }
 
     fn local(&mut self, l: &LocalDecl) {
-        // #2577: remember fn-local constant names, so the channel-send operand
-        // check can keep the `(Float, Int)` direction fail-open for them —
-        // `const k = 2` is an untyped constant and `ch <- k` builds for a
-        // `chan float64`. Recorded here because consts never enter `self.scopes`.
-        if matches!(l.kind, LocalKind::Const) {
+        // #2577: remember fn-local constants declared WITHOUT a type ascription.
+        // `const k = 2` is untyped and `ch <- k` builds for a `chan float64`;
+        // `const k int = 2` is typed and Go refuses the same send. Recorded here
+        // because consts never enter `self.scopes`.
+        if matches!(l.kind, LocalKind::Const) && l.ty.is_none() {
             for n in &l.names {
-                self.const_names.insert(n.clone());
+                self.untyped_const_names.insert(n.clone());
             }
         }
         // Only the short declaration operator needs freshness checks.
@@ -3407,15 +3416,16 @@ impl<'a> Collector<'a> {
     }
 
     /// Family B6 (#425): `s++`, `s--`, and compound assignment operand checks.
-    /// Is `name` a declared constant — file-level (`self.file_consts`) or
-    /// fn-local (`self.const_names`, filled by `fn local`)?
+    /// Is `name` a constant declared WITHOUT a type ascription — file-level
+    /// (`self.file_untyped_consts`) or fn-local (`self.untyped_const_names`)?
     ///
-    /// Used by the send check (#2577): a constant keeps the `(Float, Int)`
-    /// direction fail-open, because `const k = 2` is untyped and `ch <- k` builds
-    /// for a `chan float64`. A name that is not a constant is a variable, and a
-    /// variable of kind `int` in a `chan float64` is a Go build failure.
-    fn is_const_name(&self, name: &str) -> bool {
-        self.const_names.contains(name) || self.file_consts.contains_key(name)
+    /// Used by the send check (#2577): an *untyped* constant is convertible in
+    /// Go, so `const k = 2; ...; ch <- k` builds for a `chan float64`. A *typed*
+    /// constant (`const k int = 2`) is refused by the same send, and so is any
+    /// name that is not a constant at all — a variable of kind `int` in a
+    /// `chan float64` is a Go build failure.
+    fn is_untyped_const_name(&self, name: &str) -> bool {
+        self.untyped_const_names.contains(name) || self.file_untyped_consts.contains(name)
     }
 
     /// A channel send's operand kinds (#2577). The sent value must be assignable
@@ -3445,12 +3455,12 @@ impl<'a> Collector<'a> {
             _ => return,
         };
         let got = self.kind_of_expr(value);
-        // A constant operand keeps the `(Float, Int)` direction fail-open: the
-        // kind model cannot tell `const k = 2` (untyped, `ch <- k` builds) from
-        // `const k int = 2` (typed, Go refuses it), and rejecting a buildable
-        // program is the regression this checker must never make.
+        // An untyped constant operand keeps the `(Float, Int)` direction
+        // fail-open: `const k = 2` is convertible and `ch <- k` builds. A typed
+        // constant is NOT (`const k int = 2` is refused by Go), and neither is a
+        // variable — so only the untyped shape is exempted here.
         let untyped_or_const = is_untyped_int_const(value)
-            || matches!(unwrap_parens(value), Expr::Ident { name, .. } if self.is_const_name(name));
+            || matches!(unwrap_parens(value), Expr::Ident { name, .. } if self.is_untyped_const_name(name));
         let conflict = kinds_conflict(&elem, &got)
             || (elem == OpKind::Float && got == OpKind::Int && !untyped_or_const);
         if conflict {

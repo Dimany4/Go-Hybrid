@@ -13,10 +13,11 @@
 //!    buildable program is the regression this checker must never make.
 //!
 //! `kinds_conflict()` — the #682 assignment helper — deliberately fails open on
-//! `(Float, Int)` for exactly that reason, so the send sites narrow it with
-//! `is_untyped_int_const` plus the constant-name check instead of reusing it
-//! blindly. The last test pins the deliberate cost of staying fail-open for a
-//! *typed* constant (`const k int = 2`), which Go does refuse.
+//! `(Float, Int)` for the untyped-constant reason, so the send sites narrow it:
+//! `is_untyped_int_const` covers literal arithmetic, and the declaration's type
+//! ascription separates an untyped `const k = 2` (convertible, accepted) from a
+//! typed `const k int = 2` (refused by Go, rejected here). Standing down inside
+//! a `managed(...)` block keeps the hatch's parity with the boundary rules.
 
 use hy_check::{check_file, CheckResult, Verdict};
 use hy_diag::Severity;
@@ -116,11 +117,22 @@ fn a_send_inside_a_managed_block_stands_down() {
 }
 
 #[test]
-fn a_typed_constant_is_deliberately_not_rejected() {
-    // Go refuses `ch <- k` for `const k int = 2` in a `chan float64`, but the
-    // kind model cannot separate it from the untyped `const k = 2` at this site.
-    // The trade is deliberate: a missed rejection, never a rejected buildable
-    // program. If this ever starts rejecting, the untyped case above is what
-    // must not regress with it.
-    accepts("fn main() {\n    const k int = 2\n    var ch chan float64\n    select {\n    ch <- k:\n    default:\n    }\n}\n");
+fn a_typed_constant_is_rejected() {
+    // `const k int = 2` is a *typed* constant: Go refuses `ch <- k` for a
+    // `chan float64` (`cannot use k (constant of type int) as float64 value in
+    // send`). The untyped `const k = 2` above is the case that must stay
+    // accepted — the declaration's ascription is what separates them.
+    rejects_with(
+        "fn main() {\n    const k int = 2\n    var ch chan float64\n    select {\n    ch <- k:\n    default:\n    }\n}\n",
+        "HYB-E1002",
+    );
+    rejects_with(
+        "const k int = 2\n\nfn main() {\n    var ch chan float64\n    ch <- k\n    _ = <-ch\n}\n",
+        "HYB-E1002",
+    );
+}
+
+#[test]
+fn a_file_level_untyped_constant_stays_accepted() {
+    accepts("const k = 2\n\nfn main() {\n    var ch chan float64\n    ch <- k\n    _ = <-ch\n}\n");
 }
