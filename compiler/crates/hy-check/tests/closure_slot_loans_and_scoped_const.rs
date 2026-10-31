@@ -30,7 +30,7 @@ fn main() {
 "#;
     assert_eq!(codes(src1), vec!["HYB-E3102"]);
 
-    let src2 = r#"const CONST_MAP = map[string]int{"k": 1}
+    let src2 = r#"const const_map = map[string]int{"k": 1}
 
 fn main() {
     if true {
@@ -38,7 +38,7 @@ fn main() {
         mutator := fn() {
             alias["k"] = 999
         }
-        alias = CONST_MAP
+        alias = const_map
         mutator()
     }
 }
