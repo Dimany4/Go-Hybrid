@@ -175,6 +175,53 @@ fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
     }
 }
 
+/// Is `e` provably an *untyped* integer constant expression (#2577)?
+///
+/// The kind model cannot tell an untyped constant from a typed `int`, which is
+/// exactly why `kinds_conflict` fails open on `(Float, Int)`. A channel send
+/// needs the narrower reading — `ch <- 1` and `ch <- 1 + 2` are legal Go for a
+/// `chan float64`, while `ch <- i` for `var i int` is not — so this predicate
+/// lets the send check contradict `kinds_conflict` in that one direction.
+///
+/// Deliberately conservative in the *reject* direction: literals and arithmetic
+/// over them are provably constant, and every declared constant name counts too
+/// (`const k = 2` is untyped and `ch <- k` builds; `const k int = 2` is typed and
+/// Go refuses it — the kind model cannot separate the two at this site, so both
+/// stay accepted). A missed rejection is the acceptable side of that trade; a
+/// rejected buildable program is not.
+fn is_untyped_int_const(e: &Expr) -> bool {
+    match unwrap_parens(e) {
+        Expr::Lit {
+            kind: LitKind::Int(_) | LitKind::Char(_),
+            ..
+        } => true,
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand,
+            ..
+        } => is_untyped_int_const(operand),
+        Expr::Binary { op, lhs, rhs, .. } => {
+            // Integer-preserving operators only: a comparison or a logical
+            // operator yields a bool, not an int constant.
+            matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr
+            ) && is_untyped_int_const(lhs)
+                && is_untyped_int_const(rhs)
+        }
+        _ => false,
+    }
+}
+
 /// Is `e` provably a single-value expression (the #905/#903 binding-count
 /// class)?
 ///
@@ -381,6 +428,16 @@ struct Collector<'a> {
     kind_scopes: Vec<HashMap<String, OpKind>>,
     /// File-level `const` kinds (#425).
     file_consts: HashMap<String, OpKind>,
+    /// Names of fn-local constants (`const k = 2`, `const k int = 2`) — #2577.
+    /// Consts never enter `scopes` (that table tracks `:=`/`let` binding reads),
+    /// so the channel-send operand check needs its own record: a constant keeps
+    /// the `(Float, Int)` direction fail-open.
+    const_names: std::collections::HashSet<String>,
+    /// Depth of enclosing `managed(...)` blocks — the audited escape hatch. The
+    /// send operand-kind check (#2577) stands down inside one, exactly like the
+    /// boundary rules: the hatch is where the human takes responsibility, and
+    /// `--report-managed` records the site (HYB-E8001).
+    managed_depth: usize,
     /// Result kinds of the function whose body is currently being walked
     /// (#577 C9/C10). Empty for a fn declared with no results — which is also
     /// the state outside any body, so `Stmt::Return` can only ever see it
@@ -416,6 +473,8 @@ pub(crate) fn check_buildable(ck: &mut Checker<'_>) {
             scopes: Vec::new(),
             kind_scopes: Vec::new(),
             file_consts: HashMap::new(),
+            const_names: std::collections::HashSet::new(),
+            managed_depth: 0,
             fn_results: Vec::new(),
             fn_results_all_named: false,
             fn_results_error_tail: false,
@@ -787,6 +846,15 @@ impl<'a> Collector<'a> {
     }
 
     fn local(&mut self, l: &LocalDecl) {
+        // #2577: remember fn-local constant names, so the channel-send operand
+        // check can keep the `(Float, Int)` direction fail-open for them —
+        // `const k = 2` is an untyped constant and `ch <- k` builds for a
+        // `chan float64`. Recorded here because consts never enter `self.scopes`.
+        if matches!(l.kind, LocalKind::Const) {
+            for n in &l.names {
+                self.const_names.insert(n.clone());
+            }
+        }
         // Only the short declaration operator needs freshness checks.
         // Every kind of fn-local declaration emits a Go binding, whose
         // name must be read somewhere in its enclosing function.
@@ -1036,6 +1104,9 @@ impl<'a> Collector<'a> {
                 // or a multi-value call here passed the checker and emitted
                 // `ch <- noop()` / `ch <- pair()`, which Go rejects.
                 self.check_single_value_position(value, "a channel send", false);
+                // #2577: the sent value must also satisfy the channel's element
+                // kind — `var i int; ch <- i` on a `chan float64` was accepted.
+                self.check_send_operand_kinds(chan, value, value.span());
                 self.expr(value);
             }
             Stmt::If {
@@ -1123,7 +1194,15 @@ impl<'a> Collector<'a> {
                     _ => {}
                 }
             }
-            Stmt::Managed { body, .. } => self.block_scoped(body),
+            Stmt::Managed { body, .. } => {
+                // #2577: the audited escape hatch — checks that argue about a
+                // boundary (or, like the send operand kinds, about what the
+                // emitted Go may contain) stand down inside it; the hatch itself
+                // is recorded by `--report-managed` (HYB-E8001).
+                self.managed_depth += 1;
+                self.block_scoped(body);
+                self.managed_depth -= 1;
+            }
             Stmt::Match { subject, arms, .. } => {
                 self.expr(subject);
                 for arm in arms {
@@ -1193,6 +1272,9 @@ impl<'a> Collector<'a> {
                     // #887: a channel send in a select arm is also a single-value
                     // position.
                     self.check_single_value_position(value, "a channel send", false);
+                    // #2577: same element-kind rule as `Stmt::Send` — the select
+                    // arm was the reported bypass, the plain send had it too.
+                    self.check_send_operand_kinds(chan, value, value.span());
                             self.expr(chan);
                             self.expr(value);
                         }
@@ -3325,6 +3407,67 @@ impl<'a> Collector<'a> {
     }
 
     /// Family B6 (#425): `s++`, `s--`, and compound assignment operand checks.
+    /// Is `name` a declared constant — file-level (`self.file_consts`) or
+    /// fn-local (`self.const_names`, filled by `fn local`)?
+    ///
+    /// Used by the send check (#2577): a constant keeps the `(Float, Int)`
+    /// direction fail-open, because `const k = 2` is untyped and `ch <- k` builds
+    /// for a `chan float64`. A name that is not a constant is a variable, and a
+    /// variable of kind `int` in a `chan float64` is a Go build failure.
+    fn is_const_name(&self, name: &str) -> bool {
+        self.const_names.contains(name) || self.file_consts.contains_key(name)
+    }
+
+    /// A channel send's operand kinds (#2577). The sent value must be assignable
+    /// to the channel's element type, exactly like an assignment target — and the
+    /// assignment helper already knows every shape mismatch Go refuses, because
+    /// `kinds_conflict` is the #682 "value of kind `got` does not satisfy a
+    /// declared type of kind `want`" predicate.
+    ///
+    /// One direction has to be narrowed rather than reused: `(Float, Int)` fails
+    /// open there (an *untyped* int constant is assignable to a float target, and
+    /// the kind model cannot tell it from an `int` variable). A send can tell
+    /// them apart for the literal case, so it rejects that direction only when
+    /// the value is provably **not** an untyped int constant.
+    ///
+    /// Both send sites call this: `Stmt::Send` had the same hole as the select
+    /// arm the report described — `var ch chan float64; var i int = 1; ch <- i`
+    /// passed `hyb check` and failed `go build` with `cannot use i (variable of
+    /// type int) as float64 value in send`.
+    fn check_send_operand_kinds(&mut self, chan: &Expr, value: &Expr, span: Span) {
+        if self.managed_depth > 0 {
+            // The audited hatch takes responsibility for this site (HYB-E8001),
+            // exactly as it does for the boundary rules.
+            return;
+        }
+        let elem = match self.kind_of_expr(chan) {
+            OpKind::Chan(e) => *e,
+            _ => return,
+        };
+        let got = self.kind_of_expr(value);
+        // A constant operand keeps the `(Float, Int)` direction fail-open: the
+        // kind model cannot tell `const k = 2` (untyped, `ch <- k` builds) from
+        // `const k int = 2` (typed, Go refuses it), and rejecting a buildable
+        // program is the regression this checker must never make.
+        let untyped_or_const = is_untyped_int_const(value)
+            || matches!(unwrap_parens(value), Expr::Ident { name, .. } if self.is_const_name(name));
+        let conflict = kinds_conflict(&elem, &got)
+            || (elem == OpKind::Float && got == OpKind::Int && !untyped_or_const);
+        if conflict {
+            self.emit_e1002(
+                span,
+                format!(
+                    "cannot send a value of type `{}` to `chan {}` — Go refuses `cannot use ... (variable of type {}) as {} value in send` (HYB-E1002)",
+                    got.label(),
+                    elem.label(),
+                    got.label(),
+                    elem.label()
+                ),
+                "the channel's element type is fixed; write an explicit conversion (`ch <- float64(i)`) when a conversion is intended",
+            );
+        }
+    }
+
     fn check_assign_operands(
         &mut self,
         targets: &[Place],
