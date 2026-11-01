@@ -305,6 +305,26 @@ fn copy_element_kinds_conflict(a: &OpKind, b: &OpKind) -> bool {
 
 /// Non-nilable types in Go and Hybrid cannot be compared to untyped nil (SPEC §3.1 N1).
 /// Nilable types: pointer, interface, slice, map, channel, function.
+/// #2997: map a known foreign result `TypeShape` to a checker `OpKind`. Only the
+/// unambiguous shapes map — `Primitive` lumps int/bool/float and the opaque
+/// handle/foreign shapes carry no kind claim, so both stay `Unknown`: the kind
+/// model must never invent a mismatch it cannot prove.
+fn type_shape_op_kind(shape: &crate::model::TypeShape) -> OpKind {
+    use crate::model::TypeShape as S;
+    match shape {
+        S::Str => OpKind::Str,
+        S::Slice(inner) => OpKind::Slice(Box::new(type_shape_op_kind(inner))),
+        S::Array(inner) => OpKind::Array(Box::new(type_shape_op_kind(inner))),
+        S::Chan(inner) => OpKind::Chan(Box::new(type_shape_op_kind(inner))),
+        S::Map(k, v) => OpKind::Map(
+            Box::new(type_shape_op_kind(k)),
+            Box::new(type_shape_op_kind(v)),
+        ),
+        S::Pointer(inner) => OpKind::Pointer(Box::new(type_shape_op_kind(inner))),
+        _ => OpKind::Unknown,
+    }
+}
+
 fn is_non_nilable(k: &OpKind) -> bool {
     matches!(
         k,
@@ -3175,6 +3195,18 @@ impl<'a> Collector<'a> {
                 }
                 if let Some(OpKind::Fn(res, _)) = self.struct_field_kind(&bk, name) {
                     return Some(res);
+                }
+                // #2997: a curated package-level call (`strings.join(...)`,
+                // `strings.split(...)`, `time.after(...)`, ...) already carries a
+                // result shape in `foreign.rs`; surface the unambiguous ones so a
+                // string / slice / channel result is not silently `Unknown`.
+                if let Expr::Ident { name: pkg, .. } = unwrap_parens(base) {
+                    if self.is_imported_pkg_root(pkg) {
+                        let k = type_shape_op_kind(&crate::foreign::package_result(pkg, name));
+                        if !matches!(k, OpKind::Unknown) {
+                            return Some(vec![k]);
+                        }
+                    }
                 }
                 None
             }
